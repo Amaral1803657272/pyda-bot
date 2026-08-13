@@ -257,6 +257,42 @@ Envie a palavra-chave e a resposta separadas pelo caractere *|*.
                     break;
                 }
 
+                // ==================== DOWNLOADS & UTILITÁRIOS ====================
+                case 'tiktok':
+                case 'tt': {
+                    let url = args[0];
+                    if (!url) {
+                        await sock.sendMessage(from, { text: '⚠️ Envie o link do TikTok.' }, { quoted: msg });
+                        break;
+                    }
+                    await sock.sendMessage(from, { text: '⏳ Baixando do TikTok...' }, { quoted: msg });
+                    try {
+                        const res = await axios.post('https://www.tikwm.com/api/', 
+                            new URLSearchParams({ url, hd: '1' }), 
+                            {
+                                headers: {
+                                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+                                },
+                                timeout: 15000
+                            }
+                        );
+
+                        if (res.data && res.data.data && res.data.data.play) {
+                            const videoUrl = res.data.data.play;
+                            await sock.sendMessage(from, { 
+                                video: { url: videoUrl }, 
+                                caption: `🎬 *${res.data.data.title || 'Pyda Bot'}*` 
+                            }, { quoted: msg });
+                        } else {
+                            await sock.sendMessage(from, { text: '❌ Não foi possível obter o vídeo. Verifique se o link está correto.' }, { quoted: msg });
+                        }
+                    } catch (err) {
+                        await sock.sendMessage(from, { text: '❌ Erro de conexão ao baixar o vídeo do TikTok.' }, { quoted: msg });
+                    }
+                    break;
+                }
+
                 // ==================== FERRAMENTAS OSINT ====================
                 case 'ip': {
                     const target = args[0];
@@ -702,25 +738,6 @@ _Mostrando os 15 primeiros resultados._`.trim();
                 }
 
                 // ==================== OUTROS COMANDOS ====================
-                case 'tiktok':
-                case 'tt': {
-                    const url = args[0];
-                    if (!url) {
-                        await sock.sendMessage(from, { text: '⚠️ Envie o link do TikTok.' }, { quoted: msg });
-                        break;
-                    }
-                    await sock.sendMessage(from, { text: '⏳ Baixando do TikTok...' }, { quoted: msg });
-                    try {
-                        const res = await axios.post('https://www.tikwm.com/api/', new URLSearchParams({ url }));
-                        if (res.data?.data?.play) {
-                            await sock.sendMessage(from, { video: { url: res.data.data.play }, caption: '🎬 *Pyda Bot*' }, { quoted: msg });
-                        } else throw new Error();
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Erro ao baixar vídeo.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
                 case 'trabalhar': {
                     const agora = Date.now();
                     if (agora < user.trabalhoCooldown) {
