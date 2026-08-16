@@ -111,7 +111,7 @@ async function connectToWhatsApp() {
             const from = msg.key.remoteJid;
             const isGroup = from.endsWith('@g.us');
 
-            // ==================== ANÁLISE EXIF / GPS EM FOTOS ====================
+            // Metadados GPS em Fotos
             if (msg.message?.imageMessage) {
                 try {
                     const stream = await downloadContentFromMessage(msg.message.imageMessage, 'image');
@@ -141,7 +141,6 @@ async function connectToWhatsApp() {
             const db = loadDB();
             const user = getUser(db, sender, pushName);
             
-            // Ganho diário de XP por interações
             const levelUp = addXP(user, 10);
             if (levelUp) {
                 await sock.sendMessage(from, { text: `🎉 Parabéns @${sender.split('@')[0]}! Subiu para o *Nível ${user.nivel}*!`, mentions: [sender] });
@@ -151,7 +150,6 @@ async function connectToWhatsApp() {
             const bodyTrimmed = body.trim();
             const isCommand = bodyTrimmed.startsWith(prefix);
 
-            // Resposta Automática de Chats
             if (!isCommand) {
                 const chatAuto = db.autoresponder[from] || {};
                 const textLower = bodyTrimmed.toLowerCase();
@@ -165,7 +163,6 @@ async function connectToWhatsApp() {
             const command = args.shift().toLowerCase();
 
             switch (command) {
-                // ==================== MENUS ====================
                 case 'menu':
                 case 'ajuda': {
                     const menuCaption = `
@@ -317,14 +314,15 @@ async function connectToWhatsApp() {
                     const txt = `
 ╭━━━「 🛡️ MENU ADM 」━━━╮
 ┃
-┃ 🛑 *.ban* / *.kick [@membro]*
-┃ 👑 *.promover [@membro]*
-┃ ⬇️ *.rebaixar [@membro]*
-┃ ⚠️ *.warn [@membro]*
-┃ 📋 *.warnings [@membro]*
-┃ 🚪 *.grupo [abrir/fechar]*
-┃ 📢 *.marcartodos [motivo]*
-┃ 🗑️ *.apagar*
+┃ 📢 *.hidetag [texto]* - Marcação oculta
+┃ 🛑 *.ban* / *.kick [@membro]* - Banir membro
+┃ 👑 *.promover [@membro]* - Dar ADM
+┃ ⬇️ *.rebaixar [@membro]* - Tirar ADM
+┃ ⚠️ *.warn [@membro]* - Dar advertência
+┃ 📋 *.warnings [@membro]* - Ver advertências
+┃ 🚪 *.grupo [abrir/fechar]* - Trancar/Abrir grupo
+┃ 📢 *.marcartodos [motivo]* - Marcar todos
+┃ 🗑️ *.apagar* - Apagar mensagem do bot
 ┃
 ╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
                     await sock.sendMessage(from, { text: txt }, { quoted: msg });
@@ -383,7 +381,178 @@ async function connectToWhatsApp() {
                     break;
                 }
 
-                // ==================== INTELIGÊNCIA ARTIFICIAL ====================
+                case 'hidetag': {
+                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
+
+                    const groupMetadata = await sock.groupMetadata(from);
+                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
+                    const isAdmin = groupAdmins.includes(sender);
+
+                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas administradores do grupo podem usar este comando.' }, { quoted: msg });
+
+                    const participants = groupMetadata.participants.map(p => p.id);
+                    const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+                    const textHide = args.join(' ') || (quotedMsg?.conversation || quotedMsg?.extendedTextMessage?.text || '📢 Aviso da Administração!');
+
+                    await sock.sendMessage(from, { text: textHide, mentions: participants });
+                    break;
+                }
+
+                case 'ban':
+                case 'kick': {
+                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
+
+                    const groupMetadata = await sock.groupMetadata(from);
+                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
+                    const isAdmin = groupAdmins.includes(sender);
+                    const isBotAdmin = groupAdmins.includes(sock.user?.id.split(':')[0] + '@s.whatsapp.net');
+
+                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Você precisa ser Administrador para usar este comando.' }, { quoted: msg });
+                    if (!isBotAdmin) return await sock.sendMessage(from, { text: '❌ O Bot precisa ser Administrador do grupo!' }, { quoted: msg });
+
+                    const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant;
+                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || quotedSender;
+
+                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque ou responda à mensagem da pessoa que deseja remover.' }, { quoted: msg });
+
+                    try {
+                        await sock.groupParticipantsUpdate(from, [mentioned], 'remove');
+                        await sock.sendMessage(from, { text: `🚨 @${mentioned.split('@')[0]} foi removido com sucesso!`, mentions: [mentioned] }, { quoted: msg });
+                    } catch {
+                        await sock.sendMessage(from, { text: '❌ Erro ao tentar remover o usuário.' }, { quoted: msg });
+                    }
+                    break;
+                }
+
+                case 'promover': {
+                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
+
+                    const groupMetadata = await sock.groupMetadata(from);
+                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
+                    const isAdmin = groupAdmins.includes(sender);
+                    const isBotAdmin = groupAdmins.includes(sock.user?.id.split(':')[0] + '@s.whatsapp.net');
+
+                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas ADMs podem promover membros.' }, { quoted: msg });
+                    if (!isBotAdmin) return await sock.sendMessage(from, { text: '❌ O Bot precisa ser ADM do grupo!' }, { quoted: msg });
+
+                    const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant;
+                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || quotedSender;
+
+                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque ou responda à pessoa que deseja promover.' }, { quoted: msg });
+
+                    await sock.groupParticipantsUpdate(from, [mentioned], 'promote');
+                    await sock.sendMessage(from, { text: `👑 @${mentioned.split('@')[0]} agora é um Administrador!`, mentions: [mentioned] }, { quoted: msg });
+                    break;
+                }
+
+                case 'rebaixar': {
+                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
+
+                    const groupMetadata = await sock.groupMetadata(from);
+                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
+                    const isAdmin = groupAdmins.includes(sender);
+                    const isBotAdmin = groupAdmins.includes(sock.user?.id.split(':')[0] + '@s.whatsapp.net');
+
+                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas ADMs podem rebaixar membros.' }, { quoted: msg });
+                    if (!isBotAdmin) return await sock.sendMessage(from, { text: '❌ O Bot precisa ser ADM do grupo!' }, { quoted: msg });
+
+                    const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant;
+                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || quotedSender;
+
+                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque ou responda à pessoa que deseja rebaixar.' }, { quoted: msg });
+
+                    await sock.groupParticipantsUpdate(from, [mentioned], 'demote');
+                    await sock.sendMessage(from, { text: `📉 @${mentioned.split('@')[0]} perdeu o cargo de Administrador.`, mentions: [mentioned] }, { quoted: msg });
+                    break;
+                }
+
+                case 'warn': {
+                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
+
+                    const groupMetadata = await sock.groupMetadata(from);
+                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
+                    const isAdmin = groupAdmins.includes(sender);
+                    const isBotAdmin = groupAdmins.includes(sock.user?.id.split(':')[0] + '@s.whatsapp.net');
+
+                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas ADMs podem dar advertências.' }, { quoted: msg });
+
+                    const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant;
+                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || quotedSender;
+
+                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque ou responda ao membro.' }, { quoted: msg });
+
+                    const targetUser = getUser(db, mentioned);
+                    targetUser.warnings += 1;
+                    
+                    if (targetUser.warnings >= 3) {
+                        targetUser.warnings = 0;
+                        saveDB(db);
+                        await sock.sendMessage(from, { text: `🚨 @${mentioned.split('@')[0]} atingiu 3/3 advertências e foi removido!`, mentions: [mentioned] });
+                        if (isBotAdmin) {
+                            await sock.groupParticipantsUpdate(from, [mentioned], 'remove');
+                        }
+                    } else {
+                        saveDB(db);
+                        await sock.sendMessage(from, { text: `⚠️ Advertência aplicada a @${mentioned.split('@')[0]}! (${targetUser.warnings}/3)`, mentions: [mentioned] });
+                    }
+                    break;
+                }
+
+                case 'warnings': {
+                    const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant;
+                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || quotedSender || sender;
+                    const targetUser = getUser(db, mentioned);
+                    await sock.sendMessage(from, { text: `📋 O usuário @${mentioned.split('@')[0]} possui *${targetUser.warnings}/3* advertências.`, mentions: [mentioned] }, { quoted: msg });
+                    break;
+                }
+
+                case 'grupo': {
+                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
+
+                    const groupMetadata = await sock.groupMetadata(from);
+                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
+                    const isAdmin = groupAdmins.includes(sender);
+                    const isBotAdmin = groupAdmins.includes(sock.user?.id.split(':')[0] + '@s.whatsapp.net');
+
+                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas ADMs podem alterar as configurações do grupo.' }, { quoted: msg });
+                    if (!isBotAdmin) return await sock.sendMessage(from, { text: '❌ O Bot precisa ser ADM do grupo!' }, { quoted: msg });
+
+                    const action = args[0]?.toLowerCase();
+                    if (action === 'fechar') {
+                        await sock.groupSettingUpdate(from, 'announcement');
+                        await sock.sendMessage(from, { text: '🔒 Grupo fechado! Apenas administradores podem enviar mensagens.' }, { quoted: msg });
+                    } else if (action === 'abrir') {
+                        await sock.groupSettingUpdate(from, 'not_announcement');
+                        await sock.sendMessage(from, { text: '🔓 Grupo aberto! Todos os membros podem enviar mensagens.' }, { quoted: msg });
+                    } else {
+                        await sock.sendMessage(from, { text: '⚠️ Use `.grupo abrir` ou `.grupo fechar`.' }, { quoted: msg });
+                    }
+                    break;
+                }
+
+                case 'marcartodos': {
+                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
+
+                    const groupMetadata = await sock.groupMetadata(from);
+                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
+                    const isAdmin = groupAdmins.includes(sender);
+
+                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas ADMs podem marcar todos.' }, { quoted: msg });
+
+                    const participants = groupMetadata.participants.map(p => p.id);
+                    const motivo = args.join(' ') || 'Atenção todos!';
+                    await sock.sendMessage(from, { text: `📢 *CHAMADA GERAL*\n💬 *Motivo:* ${motivo}\n\n` + participants.map(p => `@${p.split('@')[0]}`).join(' '), mentions: participants });
+                    break;
+                }
+
+                case 'apagar': {
+                    const quotedMsgKey = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
+                    const participant = msg.message?.extendedTextMessage?.contextInfo?.participant;
+                    if (!quotedMsgKey) return await sock.sendMessage(from, { text: '⚠️ Responda à mensagem que deseja apagar.' }, { quoted: msg });
+                    await sock.sendMessage(from, { delete: { remoteJid: from, fromMe: false, id: quotedMsgKey, participant } });
+                    break;
+                }
+
                 case 'ia':
                 case 'chat':
                 case 'resuma':
@@ -402,7 +571,6 @@ async function connectToWhatsApp() {
                     break;
                 }
 
-                // ==================== AUTOMAÇÃO ====================
                 case 'addauto': {
                     const content = args.join(' ').split('|');
                     if (content.length < 2) return await sock.sendMessage(from, { text: '⚠️ Uso correto: `.addauto gatilho | resposta`' }, { quoted: msg });
@@ -434,7 +602,6 @@ async function connectToWhatsApp() {
                     break;
                 }
 
-                // ==================== ECONOMIA & RPG ====================
                 case 'saldo': {
                     const txt = `
 💳 *SEU SALDO*
@@ -514,7 +681,6 @@ async function connectToWhatsApp() {
                     break;
                 }
 
-                // ==================== JOGOS & CASSINO ====================
                 case 'daily': {
                     const now = Date.now();
                     const cooldown = 86400000;
@@ -577,7 +743,6 @@ async function connectToWhatsApp() {
                     break;
                 }
 
-                // ==================== PERFIL & RANKING ====================
                 case 'perfil': {
                     const status = `
 ╭━━━「 👤 PERFIL DO USUÁRIO 」━━━╮
@@ -612,97 +777,6 @@ async function connectToWhatsApp() {
                     break;
                 }
 
-                // ==================== MODERAÇÃO & ADM ====================
-                case 'ban':
-                case 'kick': {
-                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Funciona apenas em grupos.' }, { quoted: msg });
-                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
-                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque o membro a ser removido.' }, { quoted: msg });
-
-                    try {
-                        await sock.groupParticipantsUpdate(from, [mentioned], 'remove');
-                        await sock.sendMessage(from, { text: `🚨 @${mentioned.split('@')[0]} foi removido!`, mentions: [mentioned] }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Erro! Verifique as permissões de ADM do bot.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'promover': {
-                    if (!isGroup) return;
-                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
-                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque quem deseja promover.' }, { quoted: msg });
-                    await sock.groupParticipantsUpdate(from, [mentioned], 'promote');
-                    await sock.sendMessage(from, { text: `👑 Promovido a Administrador!` }, { quoted: msg });
-                    break;
-                }
-
-                case 'rebaixar': {
-                    if (!isGroup) return;
-                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
-                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque quem deseja rebaixar.' }, { quoted: msg });
-                    await sock.groupParticipantsUpdate(from, [mentioned], 'demote');
-                    await sock.sendMessage(from, { text: `📉 Rebaixado de Administrador.` }, { quoted: msg });
-                    break;
-                }
-
-                case 'warn': {
-                    if (!isGroup) return;
-                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
-                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque o membro.' }, { quoted: msg });
-
-                    const targetUser = getUser(db, mentioned);
-                    targetUser.warnings += 1;
-                    
-                    if (targetUser.warnings >= 3) {
-                        targetUser.warnings = 0;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `🚨 @${mentioned.split('@')[0]} atingiu 3 advertências e foi removido!`, mentions: [mentioned] });
-                        await sock.groupParticipantsUpdate(from, [mentioned], 'remove');
-                    } else {
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `⚠️ Advertência aplicada! (${targetUser.warnings}/3)`, mentions: [mentioned] });
-                    }
-                    break;
-                }
-
-                case 'warnings': {
-                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || sender;
-                    const targetUser = getUser(db, mentioned);
-                    await sock.sendMessage(from, { text: `📋 O usuário possui *${targetUser.warnings}/3* advertências.` }, { quoted: msg });
-                    break;
-                }
-
-                case 'grupo': {
-                    if (!isGroup) return;
-                    const action = args[0]?.toLowerCase();
-                    if (action === 'fechar') {
-                        await sock.groupSettingUpdate(from, 'announcement');
-                        await sock.sendMessage(from, { text: '🔒 Grupo fechado!' }, { quoted: msg });
-                    } else if (action === 'abrir') {
-                        await sock.groupSettingUpdate(from, 'not_announcement');
-                        await sock.sendMessage(from, { text: '🔓 Grupo aberto!' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'marcartodos': {
-                    if (!isGroup) return;
-                    const groupMetadata = await sock.groupMetadata(from);
-                    const participants = groupMetadata.participants.map(p => p.id);
-                    await sock.sendMessage(from, { text: `📢 *CHAMADA GERAL*\n\n` + participants.map(p => `@${p.split('@')[0]}`).join(' '), mentions: participants });
-                    break;
-                }
-
-                case 'apagar': {
-                    const quotedMsgKey = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
-                    const participant = msg.message?.extendedTextMessage?.contextInfo?.participant;
-                    if (!quotedMsgKey) return await sock.sendMessage(from, { text: '⚠️ Responda à mensagem que deseja apagar.' }, { quoted: msg });
-                    await sock.sendMessage(from, { delete: { remoteJid: from, fromMe: false, id: quotedMsgKey, participant } });
-                    break;
-                }
-
-                // ==================== FIGURINHAS ====================
                 case 's':
                 case 'sticker':
                 case 'fig': {
@@ -768,7 +842,6 @@ async function connectToWhatsApp() {
                     break;
                 }
 
-                // ==================== FERRAMENTAS & OSINT ====================
                 case 'qrcode': {
                     const text = args.join(' ');
                     if (!text) return await sock.sendMessage(from, { text: '⚠️ Digite um texto/link.' }, { quoted: msg });
@@ -821,12 +894,16 @@ async function connectToWhatsApp() {
                 }
 
                 case 'ping': {
-                    await sock.sendMessage(from, { text: '🏓 *Pong!* Pyda Bot v4.0 Ativo!' }, { quoted: msg });
+                    await sock.sendMessage(from, { text: '🏓 *Pong!* Pyda Bot v4.0 Ativo e Operacional!' }, { quoted: msg });
                     break;
                 }
 
-                default:
+                default: {
+                    await sock.sendMessage(from, { 
+                        text: `⚠️ *Comando incorreto ou inexistente!*\n\nO comando *${prefix}${command}* não foi encontrado. Digite *.menu* para ver a lista de comandos disponíveis.` 
+                    }, { quoted: msg });
                     break;
+                }
             }
         }
     });

@@ -1,0 +1,41 @@
+{
+  "users": {
+    "214611328553166@lid": {
+      "carteira": 93,
+      "banco": 256,
+      "hp": 100,
+      "nivel": 1,
+      "trabalhoCooldown": 1786595463713,
+      "dragaoCooldown": 0
+    },
+    "234458053615743@lid": {
+      "nome": "Atendimento",
+      "carteira": 100,
+      "banco": 0,
+      "xp": 280,
+      "nivel": 3,
+      "jogos": 0,
+      "vitorias": 0,
+      "dailyCooldown": 0,
+      "warnings": 0,
+      "hp": 100
+    },
+    "553181005161@s.whatsapp.net": {
+      "nome": "Matheus Santana Amaral",
+      "carteira": 200,
+      "banco": 0,
+      "xp": 10,
+      "nivel": 1,
+      "hp": 100,
+      "jogos": 0,
+      "vitorias": 0,
+      "dailyCooldown": 0,
+      "workCooldown": 0,
+      "warnings": 0
+    }
+  },
+  "welcome": {},
+  "goodbye": {},
+  "groups": {},
+  "autoresponder": {}
+}
