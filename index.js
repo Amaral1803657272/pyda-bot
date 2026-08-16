@@ -7,7 +7,10 @@ const {
 const pino = require('pino');
 const readline = require('readline');
 const fs = require('fs');
+const path = require('path');
 const axios = require('axios');
+const ffmpeg = require('fluent-ffmpeg');
+const exifParser = require('exif-parser');
 
 const rl = readline.createInterface({
     input: process.stdin,
@@ -15,17 +18,20 @@ const rl = readline.createInterface({
 });
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
-// Foto oficial do menu
+// Foto oficial do menu e Chave do SerpApi
 const BOT_LOGO_URL = 'https://i.postimg.cc/gc7hhDcF/file-00000000e328820e9000f592feb5a047.png';
+const SERPAPI_KEY = '620a2024ca25d90d361ce248a15d6c2ca740ae0687ce3e8d95eccdac14d6ce7e';
 
-// Banco de dados local
+// Banco de Dados Local
 const DB_FILE = './database.json';
 if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify({ users: {}, welcome: {}, goodbye: {}, autoresponder: {} }, null, 2));
+    fs.writeFileSync(DB_FILE, JSON.stringify({ users: {}, groups: {}, autoresponder: {} }, null, 2));
 }
 
 function loadDB() {
     let data = JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
+    if (!data.users) data.users = {};
+    if (!data.groups) data.groups = {};
     if (!data.autoresponder) data.autoresponder = {};
     return data;
 }
@@ -34,17 +40,35 @@ function saveDB(data) {
     fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 }
 
-function getUser(db, sender) {
+function getUser(db, sender, name = 'Usuário') {
     if (!db.users[sender]) {
         db.users[sender] = {
-            carteira: 100,
+            nome: name,
+            carteira: 200,
             banco: 0,
-            hp: 100,
+            xp: 0,
             nivel: 1,
-            trabalhoCooldown: 0
+            hp: 100,
+            jogos: 0,
+            vitorias: 0,
+            dailyCooldown: 0,
+            workCooldown: 0,
+            warnings: 0
         };
     }
+    db.users[sender].nome = name;
+    if (db.users[sender].hp === undefined) db.users[sender].hp = 100;
     return db.users[sender];
+}
+
+function addXP(user, amount) {
+    user.xp += amount;
+    const nextLevel = user.nivel * 100;
+    if (user.xp >= nextLevel) {
+        user.nivel += 1;
+        return true;
+    }
+    return false;
 }
 
 async function connectToWhatsApp() {
@@ -65,14 +89,19 @@ async function connectToWhatsApp() {
         if (phoneNumber) {
             setTimeout(async () => {
                 const code = await sock.requestPairingCode(phoneNumber);
-                console.log(`\n🔑 CÓDIGO: \x1b[32m${code}\x1b[0m\n`);
+                console.log(`\n🔑 CÓDIGO DE PAREAMENTO: \x1b[32m${code}\x1b[0m\n`);
             }, 3000);
         }
     }
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection } = update;
-        if (connection === 'open') console.log('\n✅ Pyda Bot v3.7 (Cassino & OSINT Pro) Conectado!');
+        const { connection, lastDisconnect } = update;
+        if (connection === 'open') {
+            console.log('\n✅ Pyda Bot v4.0 Conectado com Sucesso!');
+        } else if (connection === 'close') {
+            const reconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (reconnect) connectToWhatsApp();
+        }
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -80,722 +109,724 @@ async function connectToWhatsApp() {
         for (const msg of messages) {
             if (!msg.message) continue;
             const from = msg.key.remoteJid;
-            const sender = msg.key.participant || msg.key.remoteJid;
             const isGroup = from.endsWith('@g.us');
-            const body = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+
+            // ==================== ANÁLISE EXIF / GPS EM FOTOS ====================
+            if (msg.message?.imageMessage) {
+                try {
+                    const stream = await downloadContentFromMessage(msg.message.imageMessage, 'image');
+                    let buffer = Buffer.alloc(0);
+                    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+                    const parser = exifParser.create(buffer);
+                    const result = parser.parse();
+
+                    if (result.tags.GPSLatitude) {
+                        const gps = `📍 *Metadados GPS Detectados!*\n─────────────────────\n🌐 Lat: ${result.tags.GPSLatitude}\n🌐 Long: ${result.tags.GPSLongitude}\n📸 Câmera: ${result.tags.Model || 'Desconhecido'}\n─────────────────────`;
+                        await sock.sendMessage(from, { text: gps }, { quoted: msg });
+                    }
+                } catch (e) { /* Sem EXIF */ }
+            }
+
+            const sender = msg.key.fromMe 
+                ? (sock.user?.id.split(':')[0] + '@s.whatsapp.net') 
+                : (msg.key.participant || msg.key.remoteJid);
+            const pushName = msg.pushName || 'Membro';
+
+            const body = msg.message.conversation || 
+                         msg.message.extendedTextMessage?.text || 
+                         msg.message.imageMessage?.caption || 
+                         msg.message.videoMessage?.caption || '';
+                         
             const prefix = '.';
-
             const db = loadDB();
+            const user = getUser(db, sender, pushName);
+            
+            // Ganho diário de XP por interações
+            const levelUp = addXP(user, 10);
+            if (levelUp) {
+                await sock.sendMessage(from, { text: `🎉 Parabéns @${sender.split('@')[0]}! Subiu para o *Nível ${user.nivel}*!`, mentions: [sender] });
+            }
+            saveDB(db);
 
-            // ==================== VERIFICAÇÃO DE AUTORESPONDER ====================
-            if (!body.startsWith(prefix)) {
+            const bodyTrimmed = body.trim();
+            const isCommand = bodyTrimmed.startsWith(prefix);
+
+            // Resposta Automática de Chats
+            if (!isCommand) {
                 const chatAuto = db.autoresponder[from] || {};
-                const textLower = body.trim().toLowerCase();
-
+                const textLower = bodyTrimmed.toLowerCase();
                 if (chatAuto[textLower]) {
                     await sock.sendMessage(from, { text: chatAuto[textLower] }, { quoted: msg });
                 }
                 continue;
             }
 
-            const args = body.slice(prefix.length).trim().split(/ +/);
+            const args = bodyTrimmed.slice(prefix.length).trim().split(/ +/);
             const command = args.shift().toLowerCase();
-            const user = getUser(db, sender);
-
-            let commandFound = true;
 
             switch (command) {
-                // ==================== PAINEL PRINCIPAL ====================
+                // ==================== MENUS ====================
                 case 'menu':
                 case 'ajuda': {
                     const menuCaption = `
-⚡ *PYDA BOT - PAINEL PRINCIPAL* ⚡
-─────────────────────
-👤 *Desenvolvedor:* Odin
-🤖 *Status:* Online
-⚙️ *Prefixo:* [ . ]
-─────────────────────
-
-Escolha uma categoria:
-
-👑 *.menudono* - Comandos do Criador
-🛡️ *.menuadm* - Moderação de Grupos
-🤖 *.menuauto* - Respostas Automáticas
-📥 *.menumembro* - Utilitários e Downloads
-⚔️ *.menurpg* - Economia e Batalhas
-🎲 *.menujogos* - Cassino e Apostas
-🔍 *.menuosint* - Ferramentas OSINT & Redes
-
-─────────────────────
-💻 _Pyda Systems v3.7_
-`.trim();
-                    await sock.sendMessage(from, { image: { url: BOT_LOGO_URL }, caption: menuCaption }, { quoted: msg });
+╭━━━「 PYDA BOT v4.0 」━━━╮
+┃
+┃ 👤 Desenvolvedor: Odin
+┃ 🤖 Status: Online
+┃ ⚙️ Prefixo: [ . ]
+┃
+┣━━「 📚 CATEGORIAS 」━━
+┃
+┃ 👑 .menudono
+┃ ┣ Comandos do Criador
+┃
+┃ 🛡️ .menuadm
+┃ ┣ Administração do Grupo
+┃
+┃ 🤖 .menuauto
+┃ ┣ Automação & Respostas
+┃
+┃ 🧰 .menumembro
+┃ ┣ Utilitários Rápidos
+┃
+┃ 🎨 .menufig
+┃ ┣ Figurinhas & Mídia
+┃
+┃ ⚔️ .menurpg
+┃ ┣ RPG & Economia
+┃
+┃ 🎮 .menujogos
+┃ ┣ Jogos & Cassino
+┃
+┃ 🧠 .menuia
+┃ ┣ Inteligência Artificial
+┃
+┃ 📥 .menudownload
+┃ ┣ Downloads
+┃
+┃ 🛠️ .menuferramentas
+┃ ┣ Ferramentas & Utilidades
+┃
+┃ 👤 .perfil
+┃ ┣ Seu Status & Moedas
+┃
+┃ 🏆 .rank
+┃ ┣ Ranking do Grupo
+┃
+┃ 🔎 .menuosint
+┃ ┣ Ferramentas OSINT
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯
+        💻 Pyda Systems v4.0`.trim();
+                    try {
+                        await sock.sendMessage(from, { image: { url: BOT_LOGO_URL }, caption: menuCaption }, { quoted: msg });
+                    } catch {
+                        await sock.sendMessage(from, { text: menuCaption }, { quoted: msg });
+                    }
                     break;
                 }
 
-                case 'menudono':
-                    await sock.sendMessage(from, { text: `👑 *MENU DONO (ODIN)*\n─────────────────────\n• *.bc [texto]* - Transmissão.\n• *.dono* - Info do criador.` }, { quoted: msg });
+                case 'menudono': {
+                    const txt = `
+╭━━━「 👑 MENU DONO 」━━━╮
+┃
+┃ 📢 *.bc [texto]* - Transmissão Geral
+┃ 👤 *.dono* - Contato do Criador
+┃ ⚙️ *.restart* - Reiniciar Bot
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
                     break;
+                }
 
-                case 'menuadm':
-                    await sock.sendMessage(from, { text: `🛡️ *MENU ADM*\n─────────────────────\n• *.grupo fechar*\n• *.grupo abrir*\n• *.apagar*` }, { quoted: msg });
+                case 'menuauto': {
+                    const txt = `
+╭━━━「 🤖 AUTOMAÇÃO 」━━━╮
+┃
+┃ 💬 *.addauto [gatilho] | [resposta]*
+┃ ❌ *.delauto [gatilho]*
+┃ 📋 *.listauto*
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
                     break;
+                }
 
-                case 'menumembro':
-                    await sock.sendMessage(from, { text: `📥 *MENU MEMBRO*\n─────────────────────\n• *.tiktok [link]*\n• *.ytmp3 [link]*\n• *.ytmp4 [link]*\n• *.revelar*\n• *.ping*` }, { quoted: msg });
+                case 'menurpg': {
+                    const txt = `
+╭━━━「 ⚔️ RPG & ECONOMIA 」━━━╮
+┃
+┃ 💼 *.trabalhar* - Ganhe dinheiro
+┃ 💳 *.saldo* - Veja suas finanças
+┃ 🏦 *.depositar [valor]* - Guardar dinheiro
+┃ 🏧 *.sacar [valor]* - Retirar dinheiro
+┃ 🐉 *.dragao* - Enfrente o Dragão
+┃ 💊 *.curar* - Restaurar HP (R$ 50)
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
                     break;
-
-                case 'menurpg':
-                    await sock.sendMessage(from, { text: `⚔️ *MENU RPG*\n─────────────────────\n• *.trabalhar*\n• *.saldo*\n• *.depositar [valor]*\n• *.sacar [valor]*\n• *.dragao*\n• *.curar*` }, { quoted: msg });
-                    break;
+                }
 
                 case 'menujogos': {
-                    const textJogos = `
-🎰 *PYDA CASSINO & JOGOS*
-─────────────────────
-🚀 *.foguete [2x/3x] [aposta]* - Crash
-🎰 *.tigrinho [aposta]* - Caça-níqueis 
-🎯 *.roleta [vermelho/preto/0-36] [aposta]* - Roleta
-🃏 *.21 [aposta]* ou *.blackjack [aposta]* - 21 Rápido
-🪙 *.caraoucoroa [cara/coroa] [aposta]* - Moeda
-🎲 *.dado* - Rola 1 dado simples
-─────────────────────`.trim();
-                    await sock.sendMessage(from, { text: textJogos }, { quoted: msg });
+                    const txt = `
+╭━━━「 🎮 CASSINO & JOGOS 」━━━╮
+┃
+┃ 🚀 *.foguete [2x/3x] [aposta]*
+┃ 🎰 *.tigrinho [aposta]*
+┃ 🎯 *.roleta [cor] [aposta]*
+┃ 🃏 *.21 [aposta]*
+┃ 🪙 *.caraoucoroa [cara/coroa] [aposta]*
+┃ 🎲 *.dado*
+┃ 🎁 *.daily* - Bônus Diário
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
+                    break;
+                }
+
+                case 'menumembro': {
+                    const txt = `
+╭━━━「 🧰 UTILITÁRIOS 」━━━╮
+┃
+┃ 🖼️ *.s* / *.fig* - Criar Sticker
+┃ 🔍 *.ping* - Testar Velocidade
+┃ 👁️ *.revelar* - Baixar Mídia Única
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
+                    break;
+                }
+
+                case 'menuia': {
+                    const txt = `
+╭━━━「 🧠 INTELIGÊNCIA ARTIFICIAL 」━━━╮
+┃
+┃ 🤖 *.ia [pergunta]*
+┃ 💬 *.chat [mensagem]*
+┃ 📝 *.resuma [texto]*
+┃ 🌐 *.traduz [texto]*
+┃ 💻 *.codigo [pedido]*
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
+                    break;
+                }
+
+                case 'menuadm': {
+                    const txt = `
+╭━━━「 🛡️ MENU ADM 」━━━╮
+┃
+┃ 🛑 *.ban* / *.kick [@membro]*
+┃ 👑 *.promover [@membro]*
+┃ ⬇️ *.rebaixar [@membro]*
+┃ ⚠️ *.warn [@membro]*
+┃ 📋 *.warnings [@membro]*
+┃ 🚪 *.grupo [abrir/fechar]*
+┃ 📢 *.marcartodos [motivo]*
+┃ 🗑️ *.apagar*
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
+                    break;
+                }
+
+                case 'menufig': {
+                    const txt = `
+╭━━━「 🎨 FIGURINHAS 」━━━╮
+┃
+┃ 🖼️ *.s* / *.fig* - Sticker de Foto/Vídeo
+┃ 🔤 *.ttp [texto]* - Sticker Texto Estático
+┃ ⚡ *.attp [texto]* - Sticker Texto Colorido
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
+                    break;
+                }
+
+                case 'menudownload': {
+                    const txt = `
+╭━━━「 📥 DOWNLOADS 」━━━╮
+┃
+┃ 🖼️ Utilizar comandos gerais de mídia.
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
+                    break;
+                }
+
+                case 'menuferramentas': {
+                    const txt = `
+╭━━━「 🛠️ FERRAMENTAS 」━━━╮
+┃
+┃ 🔳 *.qrcode [texto]*
+┃ 🌤️ *.clima [cidade]*
+┃ 🔗 *.encurtar [link]*
+┃ 🔑 *.senha [tamanho]*
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
                     break;
                 }
 
                 case 'menuosint': {
-                    const textOsint = `
-🔍 *PAINEL OSINT & INFRAESTRUTURA*
-─────────────────────
-🌐 *.ip [ip]* - Geolocalização e provedor.
-🔎 *.dns [dominio]* - Registros DNS (A/IPs).
-📄 *.whois [dominio]* - Dados de registro RDAP.
-🛡️ *.emailsec [dominio]* - Checagem SPF e DMARC.
-🏢 *.cnpj [numero]* - Dados de empresa na Receita.
-📍 *.cep [numero]* - Localização por CEP.
-🌐 *.subdominios [dominio]* - Busca por certificado SSL.
-🔄 *.rdns [ip]* - Reverse DNS (PTR).
-📶 *.mac [mac]* - Fabricante do dispositivo.
-⚡ *.httpcheck [site]* - Status, latência e servidor.
-─────────────────────`.trim();
-                    await sock.sendMessage(from, { text: textOsint }, { quoted: msg });
+                    const txt = `
+╭━━━「 🔎 FERRAMENTAS OSINT 」━━━╮
+┃
+┃ 🔎 *.search [termo]* - Google
+┃ 🌐 *.ip [ip]* - Localizar IP
+┃ 🏢 *.cnpj [cnpj]* - Dados da Empresa
+┃ 📍 *.cep [cep]* - Buscar Endereço
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
                     break;
                 }
 
-                // ==================== AUTORESPONDER ====================
-                case 'menuauto': {
-                    const textAuto = `
-🤖 *AUTOMAÇÃO & RESPONDEDOR*
-─────────────────────
-💡 *Como funciona?*
-Envie a palavra-chave e a resposta separadas pelo caractere *|*.
-
-• *.addauto [gatilho] | [resposta]*
-  _Exemplo:_ \`.addauto oi | Olá, tudo bem? Como posso te ajudar hoje?\`
-
-• *.delauto [gatilho]* - Remove um gatilho.
-• *.meusautos* - Lista todos os gatilhos do chat.
-─────────────────────`.trim();
-                    await sock.sendMessage(from, { text: textAuto }, { quoted: msg });
-                    break;
-                }
-
-                case 'addauto': {
-                    const content = args.join(' ');
-                    const [gatilho, ...respostaParts] = content.split('|');
-                    const resposta = respostaParts.join('|').trim();
-
-                    if (!gatilho || !resposta) {
-                        await sock.sendMessage(from, { 
-                            text: '⚠️ *Formato incorreto!*\n\nUse: `.addauto [palavra-chave] | [resposta]`\n\n*Exemplo:*\n`.addauto oi | Olá! Seja bem-vindo!`' 
-                        }, { quoted: msg });
-                        break;
+                // ==================== INTELIGÊNCIA ARTIFICIAL ====================
+                case 'ia':
+                case 'chat':
+                case 'resuma':
+                case 'traduz':
+                case 'codigo': {
+                    const prompt = args.join(' ');
+                    if (!prompt) return await sock.sendMessage(from, { text: '⚠️ Digite algo para a Inteligência Artificial.' }, { quoted: msg });
+                    await sock.sendMessage(from, { text: '🧠 *Processando...*' }, { quoted: msg });
+                    try {
+                        const res = await axios.get(`https://api.simsimi.vn/v2/simsimi?text=${encodeURIComponent(prompt)}&lc=pt`);
+                        const reply = res.data.success || 'Não consegui processar o pedido.';
+                        await sock.sendMessage(from, { text: `🤖 *Pyda IA:* ${reply}` }, { quoted: msg });
+                    } catch {
+                        await sock.sendMessage(from, { text: '❌ O servidor de IA está indisponível no momento.' }, { quoted: msg });
                     }
+                    break;
+                }
 
+                // ==================== AUTOMAÇÃO ====================
+                case 'addauto': {
+                    const content = args.join(' ').split('|');
+                    if (content.length < 2) return await sock.sendMessage(from, { text: '⚠️ Uso correto: `.addauto gatilho | resposta`' }, { quoted: msg });
+                    const gatilho = content[0].trim().toLowerCase();
+                    const resposta = content[1].trim();
+                    
                     if (!db.autoresponder[from]) db.autoresponder[from] = {};
-                    db.autoresponder[from][gatilho.trim().toLowerCase()] = resposta;
+                    db.autoresponder[from][gatilho] = resposta;
                     saveDB(db);
-
-                    await sock.sendMessage(from, { 
-                        text: `✅ *Autoresponder Cadastrado!*\n─────────────────────\n🔑 *Gatilho:* "${gatilho.trim().toLowerCase()}"\n💬 *Resposta:* ${resposta}` 
-                    }, { quoted: msg });
+                    await sock.sendMessage(from, { text: `✅ Resposta criada para: *${gatilho}*` }, { quoted: msg });
                     break;
                 }
 
                 case 'delauto': {
                     const gatilho = args.join(' ').trim().toLowerCase();
-                    if (!gatilho) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.delauto [palavra-chave]`' }, { quoted: msg });
-                        break;
-                    }
+                    if (!gatilho || !db.autoresponder[from]?.[gatilho]) return await sock.sendMessage(from, { text: '⚠️ Gatilho não encontrado.' }, { quoted: msg });
+                    delete db.autoresponder[from][gatilho];
+                    saveDB(db);
+                    await sock.sendMessage(from, { text: `🗑️ Resposta removida!` }, { quoted: msg });
+                    break;
+                }
 
-                    if (db.autoresponder[from] && db.autoresponder[from][gatilho]) {
-                        delete db.autoresponder[from][gatilho];
+                case 'listauto': {
+                    const list = db.autoresponder[from];
+                    if (!list || Object.keys(list).length === 0) return await sock.sendMessage(from, { text: 'ℹ️ Nenhuma resposta automática cadastrada neste chat.' }, { quoted: msg });
+                    let txt = `📋 *RESPOSTAS AUTOMÁTICAS:*\n─────────────────────\n`;
+                    for (let g in list) txt += `• *${g}* ➔ ${list[g]}\n`;
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
+                    break;
+                }
+
+                // ==================== ECONOMIA & RPG ====================
+                case 'saldo': {
+                    const txt = `
+💳 *SEU SALDO*
+─────────────────────
+👤 *Nome:* ${user.nome}
+💵 *Carteira:* R$ ${user.carteira}
+🏦 *Banco:* R$ ${user.banco}
+❤️ *Vida (HP):* ${user.hp}/100
+⭐ *Nível:* ${user.nivel} (${user.xp} XP)
+─────────────────────`.trim();
+                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
+                    break;
+                }
+
+                case 'trabalhar': {
+                    const cooldown = 3600000;
+                    const now = Date.now();
+                    if (user.workCooldown && (now - user.workCooldown < cooldown)) {
+                        const remaining = Math.ceil((cooldown - (now - user.workCooldown)) / 60000);
+                        return await sock.sendMessage(from, { text: `⏳ Você está cansado. Espere ${remaining} minutos para trabalhar de novo.` }, { quoted: msg });
+                    }
+                    const ganho = Math.floor(Math.random() * 250) + 50;
+                    user.carteira += ganho;
+                    user.workCooldown = now;
+                    saveDB(db);
+                    await sock.sendMessage(from, { text: `🛠️ Você trabalhou e ganhou *R$ ${ganho}*!` }, { quoted: msg });
+                    break;
+                }
+
+                case 'depositar': {
+                    const val = parseInt(args[0]);
+                    if (isNaN(val) || val <= 0) return await sock.sendMessage(from, { text: '⚠️ Digite um valor válido. Ex: `.depositar 100`' }, { quoted: msg });
+                    if (user.carteira < val) return await sock.sendMessage(from, { text: '❌ Saldo insuficiente em carteira.' }, { quoted: msg });
+                    user.carteira -= val;
+                    user.banco += val;
+                    saveDB(db);
+                    await sock.sendMessage(from, { text: `🏦 R$ ${val} depositados com sucesso no banco!` }, { quoted: msg });
+                    break;
+                }
+
+                case 'sacar': {
+                    const val = parseInt(args[0]);
+                    if (isNaN(val) || val <= 0) return await sock.sendMessage(from, { text: '⚠️ Digite um valor válido. Ex: `.sacar 100`' }, { quoted: msg });
+                    if (user.banco < val) return await sock.sendMessage(from, { text: '❌ Saldo insuficiente no banco.' }, { quoted: msg });
+                    user.banco -= val;
+                    user.carteira += val;
+                    saveDB(db);
+                    await sock.sendMessage(from, { text: `🏧 R$ ${val} sacados do banco!` }, { quoted: msg });
+                    break;
+                }
+
+                case 'dragao': {
+                    if (user.hp <= 20) return await sock.sendMessage(from, { text: '❌ Sua vida está muito baixa! Use `.curar` primeiro.' }, { quoted: msg });
+                    const resultado = Math.random() > 0.4;
+                    user.jogos += 1;
+                    if (resultado) {
+                        const premio = Math.floor(Math.random() * 400) + 200;
+                        user.carteira += premio;
+                        user.vitorias += 1;
                         saveDB(db);
-                        await sock.sendMessage(from, { text: `🗑️ Gatilho *"${gatilho}"* removido com sucesso!` }, { quoted: msg });
+                        await sock.sendMessage(from, { text: `⚔️ 🐉 *VITÓRIA!* Você derrotou o Dragão e ganhou *R$ ${premio}*!` }, { quoted: msg });
                     } else {
-                        await sock.sendMessage(from, { text: '❌ Este gatilho não existe.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'meusautos': {
-                    const chatAuto = db.autoresponder[from] || {};
-                    const gatilhos = Object.keys(chatAuto);
-
-                    if (gatilhos.length === 0) {
-                        await sock.sendMessage(from, { text: '🤖 Nenhuma resposta automática cadastrada neste chat.' }, { quoted: msg });
-                        break;
-                    }
-
-                    let lista = `🤖 *RESPOSTAS AUTOMÁTICAS ATIVAS*\n─────────────────────\n`;
-                    gatilhos.forEach(g => {
-                        lista += `• *Gatilho:* "${g}"\n  👉 *Resposta:* ${chatAuto[g]}\n\n`;
-                    });
-                    await sock.sendMessage(from, { text: lista.trim() }, { quoted: msg });
-                    break;
-                }
-
-                // ==================== DOWNLOADS & UTILITÁRIOS ====================
-                case 'tiktok':
-                case 'tt': {
-                    let url = args[0];
-                    if (!url) {
-                        await sock.sendMessage(from, { text: '⚠️ Envie o link do TikTok.' }, { quoted: msg });
-                        break;
-                    }
-                    await sock.sendMessage(from, { text: '⏳ Baixando do TikTok...' }, { quoted: msg });
-                    try {
-                        const res = await axios.post('https://www.tikwm.com/api/', 
-                            new URLSearchParams({ url, hd: '1' }), 
-                            {
-                                headers: {
-                                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-                                },
-                                timeout: 15000
-                            }
-                        );
-
-                        if (res.data && res.data.data && res.data.data.play) {
-                            const videoUrl = res.data.data.play;
-                            await sock.sendMessage(from, { 
-                                video: { url: videoUrl }, 
-                                caption: `🎬 *${res.data.data.title || 'Pyda Bot'}*` 
-                            }, { quoted: msg });
-                        } else {
-                            await sock.sendMessage(from, { text: '❌ Não foi possível obter o vídeo. Verifique se o link está correto.' }, { quoted: msg });
-                        }
-                    } catch (err) {
-                        await sock.sendMessage(from, { text: '❌ Erro de conexão ao baixar o vídeo do TikTok.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                // ==================== FERRAMENTAS OSINT ====================
-                case 'ip': {
-                    const target = args[0];
-                    if (!target) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.ip [endereço-ip]` (Ex: `.ip 8.8.8.8`)' }, { quoted: msg });
-                        break;
-                    }
-                    try {
-                        const res = await axios.get(`http://ip-api.com/json/${target}`);
-                        if (res.data.status === 'fail') {
-                            await sock.sendMessage(from, { text: '❌ IP inválido ou não encontrado.' }, { quoted: msg });
-                            break;
-                        }
-                        const info = `
-🌐 *INFORMAÇÕES DE IP*
-─────────────────────
-📌 IP: *${res.data.query}*
-🏳️ País: *${res.data.country} (${res.data.countryCode})*
-🏙️ Estado/Cidade: *${res.data.regionName} / ${res.data.city}*
-🏢 Provedor (ISP): *${res.data.isp}*
-🌐 ASN/Org: *${res.data.org}*
-─────────────────────`.trim();
-                        await sock.sendMessage(from, { text: info }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Erro ao consultar o IP.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'dns': {
-                    const domain = args[0]?.replace('https://', '').replace('http://', '').split('/')[0];
-                    if (!domain) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.dns [dominio]` (Ex: `.dns google.com`)' }, { quoted: msg });
-                        break;
-                    }
-                    try {
-                        const resA = await axios.get(`https://dns.google/resolve?name=${domain}&type=A`);
-                        const ips = resA.data?.Answer?.map(a => a.data).join(', ') || 'Nenhum registro A';
-
-                        const info = `
-🔎 *REGISTROS DNS (GOOGLE DOH)*
-─────────────────────
-🌐 Domínio: *${domain}*
-📌 Registros A (IPs): *${ips}*
-─────────────────────`.trim();
-                        await sock.sendMessage(from, { text: info }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Falha ao realizar lookup DNS.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'whois': {
-                    const domain = args[0]?.replace('https://', '').replace('http://', '').split('/')[0];
-                    if (!domain) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.whois [dominio]` (Ex: `.whois google.com`)' }, { quoted: msg });
-                        break;
-                    }
-                    await sock.sendMessage(from, { text: '⏳ Consultando registro de domínio (RDAP)...' }, { quoted: msg });
-                    try {
-                        const res = await axios.get(`https://rdap.org/domain/${domain}`, { timeout: 8000 });
-                        const data = res.data;
-                        
-                        const handle = data.handle || 'N/A';
-                        const events = data.events || [];
-                        const regEvent = events.find(e => e.eventAction === 'registration')?.eventDate || 'N/A';
-                        const expEvent = events.find(e => e.eventAction === 'expiration')?.eventDate || 'N/A';
-
-                        const info = `
-🔎 *CONSULTA WHOIS / RDAP*
-─────────────────────
-🌐 Domínio: *${domain}*
-🆔 ID Registro: *${handle}*
-📅 Data de Criacao: *${regEvent.split('T')[0]}*
-⌛ Data de Expiracao: *${expEvent.split('T')[0]}*
-─────────────────────`.trim();
-                        await sock.sendMessage(from, { text: info }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Não foi possível obter dados WHOIS para este domínio.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'emailsec': {
-                    const domain = args[0]?.replace('https://', '').replace('http://', '').split('/')[0];
-                    if (!domain) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.emailsec [dominio]` (Ex: `.emailsec github.com`)' }, { quoted: msg });
-                        break;
-                    }
-                    try {
-                        const spfRes = await axios.get(`https://dns.google/resolve?name=${domain}&type=TXT`);
-                        const txtRecords = spfRes.data?.Answer?.map(a => a.data) || [];
-                        const spfRecord = txtRecords.find(r => r.includes('v=spf1')) || '❌ Nenhum registro SPF encontrado';
-
-                        const dmarcRes = await axios.get(`https://dns.google/resolve?name=_dmarc.${domain}&type=TXT`);
-                        const dmarcRecords = dmarcRes.data?.Answer?.map(a => a.data) || [];
-                        const dmarcRecord = dmarcRecords.find(r => r.includes('v=DMARC1')) || '❌ Nenhum registro DMARC encontrado';
-
-                        const info = `
-🛡️ *AUDITORIA DE SEGURANÇA DE E-MAIL*
-─────────────────────
-🌐 Domínio: *${domain}*
-
-📧 *Registro SPF:*
-\`\`\`${spfRecord.replace(/"/g, '')}\`\`\`
-
-🔒 *Registro DMARC:*
-\`\`\`${dmarcRecord.replace(/"/g, '')}\`\`\`
-─────────────────────`.trim();
-                        await sock.sendMessage(from, { text: info }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Erro ao auditar registros do domínio.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'cnpj': {
-                    const cnpjTarget = args[0] ? args[0].replace(/[^0-9]/g, '') : '';
-                    if (!cnpjTarget || cnpjTarget.length !== 14) {
-                        await sock.sendMessage(from, { text: '⚠️ Digite um CNPJ com 14 números. Ex: `.cnpj 00000000000000`' }, { quoted: msg });
-                        break;
-                    }
-                    try {
-                        const res = await axios.get(`https://receitaws.com.br/v1/cnpj/${cnpjTarget}`);
-                        if (res.data.status === 'ERROR') {
-                            await sock.sendMessage(from, { text: '❌ CNPJ não localizado.' }, { quoted: msg });
-                            break;
-                        }
-                        const info = `
-🏢 *DADOS DE EMPRESA (CNPJ)*
-─────────────────────
-📋 Razão Social: *${res.data.nome}*
-🏷️ Nome Fantasia: *${res.data.fantasia || 'N/A'}*
-📅 Abertura: *${res.data.abertura}*
-⚡ Situação: *${res.data.situacao}*
-📍 Cidade/UF: *${res.data.municipio}/${res.data.uf}*
-💼 Atividade: *${res.data.atividade_principal[0]?.text || 'N/A'}*
-─────────────────────`.trim();
-                        await sock.sendMessage(from, { text: info }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Erro na consulta do CNPJ.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'cep': {
-                    const cepTarget = args[0] ? args[0].replace(/[^0-9]/g, '') : '';
-                    if (!cepTarget || cepTarget.length !== 8) {
-                        await sock.sendMessage(from, { text: '⚠️ Digite um CEP com 8 números. Ex: `.cep 01001000`' }, { quoted: msg });
-                        break;
-                    }
-                    try {
-                        const res = await axios.get(`https://viacep.com.br/ws/${cepTarget}/json/`);
-                        if (res.data.erro) {
-                            await sock.sendMessage(from, { text: '❌ CEP inexistente.' }, { quoted: msg });
-                            break;
-                        }
-                        const info = `
-📍 *LOCALIZAÇÃO DE CEP*
-─────────────────────
-📮 CEP: *${res.data.cep}*
-🛣️ Endereço: *${res.data.logradouro}*
-🏙️ Bairro: *${res.data.bairro}*
-🌆 Cidade/UF: *${res.data.localidade}/${res.data.uf}*
-─────────────────────`.trim();
-                        await sock.sendMessage(from, { text: info }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Falha ao buscar CEP.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'subdominios': {
-                    const domain = args[0]?.replace('https://', '').replace('http://', '').split('/')[0];
-                    if (!domain) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.subdominios [dominio]` (Ex: `.subdominios github.com`)' }, { quoted: msg });
-                        break;
-                    }
-                    await sock.sendMessage(from, { text: '⏳ Mapeando certificados SSL...' }, { quoted: msg });
-                    try {
-                        const res = await axios.get(`https://crt.sh/?q=%.${domain}&output=json`);
-                        const rawSubs = res.data.map(item => item.name_value).join('\n').split('\n');
-                        const uniqueSubs = [...new Set(rawSubs)].filter(s => !s.includes('*')).slice(0, 15);
-
-                        if (uniqueSubs.length === 0) {
-                            await sock.sendMessage(from, { text: '❌ Nenhum subdomínio encontrado.' }, { quoted: msg });
-                            break;
-                        }
-
-                        const info = `
-🌐 *SUBDOMÍNIOS ENCONTRADOS (CRT.SH)*
-─────────────────────
-${uniqueSubs.map(s => `• ${s}`).join('\n')}
-─────────────────────
-_Mostrando os 15 primeiros resultados._`.trim();
-                        await sock.sendMessage(from, { text: info }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Erro ao listar subdomínios.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'rdns': {
-                    const ip = args[0];
-                    if (!ip) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.rdns [IP]` (Ex: `.rdns 8.8.8.8`)' }, { quoted: msg });
-                        break;
-                    }
-                    try {
-                        const reversedIp = ip.split('.').reverse().join('.') + '.in-addr.arpa';
-                        const res = await axios.get(`https://dns.google/resolve?name=${reversedIp}&type=PTR`);
-                        const hostname = res.data?.Answer?.[0]?.data || 'Nenhum PTR (Reverse DNS) encontrado.';
-
-                        const info = `
-🔄 *REVERSE DNS (PTR)*
-─────────────────────
-📌 IP: *${ip}*
-🖥️ Hostname: *${hostname}*
-─────────────────────`.trim();
-                        await sock.sendMessage(from, { text: info }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Erro ao realizar consulta Reverse DNS.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'mac': {
-                    const macTarget = args[0];
-                    if (!macTarget) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.mac [endereço-mac]` (Ex: `.mac 00:1A:2B:3C:4D:5E`)' }, { quoted: msg });
-                        break;
-                    }
-                    try {
-                        const res = await axios.get(`https://api.macvendors.com/${encodeURIComponent(macTarget)}`);
-                        const info = `
-📶 *CONSULTA FABRICANTE DE MAC*
-─────────────────────
-🏷️ MAC: *${macTarget}*
-🏢 Fabricante: *${res.data}*
-─────────────────────`.trim();
-                        await sock.sendMessage(from, { text: info }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Endereço MAC não encontrado ou fabricante desconhecido.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'httpcheck': {
-                    let targetUrl = args[0];
-                    if (!targetUrl) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.httpcheck [site]` (Ex: `.httpcheck google.com`)' }, { quoted: msg });
-                        break;
-                    }
-                    if (!targetUrl.startsWith('http')) targetUrl = 'https://' + targetUrl;
-
-                    const start = Date.now();
-                    try {
-                        const res = await axios.get(targetUrl, { timeout: 6000, maxRedirects: 5 });
-                        const duration = Date.now() - start;
-
-                        const info = `
-🌐 *ANÁLISE DE STATUS HTTP*
-─────────────────────
-🔗 URL: *${targetUrl}*
-🚦 Status: *${res.status} ${res.statusText}*
-⚡ Latência: *${duration} ms*
-🖥️ Servidor: *${res.headers['server'] || 'Oculto / Não informado'}*
-📦 Tipo de Conteúdo: *${res.headers['content-type'] || 'N/A'}*
-─────────────────────`.trim();
-                        await sock.sendMessage(from, { text: info }, { quoted: msg });
-                    } catch (err) {
-                        const duration = Date.now() - start;
-                        await sock.sendMessage(from, { 
-                            text: `❌ *Falha de Conexão*\n─────────────────────\n🔗 URL: *${targetUrl}*\n⚠️ Erro: *${err.message}*\n⏱️ Tempo decorrido: *${duration} ms*` 
-                        }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                // ==================== CASSINO ====================
-                case 'foguete':
-                case 'crash': {
-                    const targetStr = args[0] ? args[0].replace('x', '').replace(',', '.') : null;
-                    const aposta = parseInt(args[1]);
-                    const alvo = parseFloat(targetStr);
-
-                    if (!alvo || isNaN(alvo) || alvo < 1.1 || !aposta || isNaN(aposta) || aposta <= 0) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.foguete 2x 50`' }, { quoted: msg });
-                        break;
-                    }
-                    if (user.carteira < aposta) {
-                        await sock.sendMessage(from, { text: `⚠️ Saldo insuficiente! Carteira: *${user.carteira}*.` }, { quoted: msg });
-                        break;
-                    }
-
-                    const rand = Math.random();
-                    let crashPoint = rand < 0.05 ? 1.0 : rand < 0.60 ? parseFloat((Math.random() * 0.9 + 1.1).toFixed(2)) : parseFloat((Math.random() * 5.0 + 2.0).toFixed(2));
-
-                    if (crashPoint >= alvo) {
-                        const total = Math.floor(aposta * alvo);
-                        const lucro = total - aposta;
-                        user.carteira += lucro;
+                        const dano = Math.floor(Math.random() * 30) + 20;
+                        user.hp -= dano;
                         saveDB(db);
-                        await sock.sendMessage(from, { text: `🚀 *FOGUETE SUBIU ATÉ ${crashPoint}x!*\n\n✅ *GANHOU!*\n💵 Retorno: *${total} PydaCoins*\n📈 Lucro: *+${lucro}*\n👛 Saldo: *${user.carteira}*` }, { quoted: msg });
-                    } else {
-                        user.carteira -= aposta;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `💥 *EXPLODIU EM ${crashPoint}x!*\n\n❌ *PERDEU!*\n📉 Prejuízo: *-${aposta} PydaCoins*\n👛 Saldo: *${user.carteira}*` }, { quoted: msg });
+                        await sock.sendMessage(from, { text: `⚔️ 💥 *DERROTA!* O Dragão te atacou e você perdeu ${dano} de HP. (HP Atual: ${user.hp})` }, { quoted: msg });
                     }
                     break;
                 }
 
-                case 'tigrinho':
-                case 'slots': {
-                    const aposta = parseInt(args[0]);
-                    if (!aposta || isNaN(aposta) || aposta <= 0) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.tigrinho [aposta]`' }, { quoted: msg });
-                        break;
-                    }
-                    if (user.carteira < aposta) {
-                        await sock.sendMessage(from, { text: `⚠️ Saldo insuficiente!` }, { quoted: msg });
-                        break;
-                    }
-
-                    const slots = ['🐯', '💎', '7️⃣', '🔔', '🍇', '🍋'];
-                    const s1 = slots[Math.floor(Math.random() * slots.length)];
-                    const s2 = slots[Math.floor(Math.random() * slots.length)];
-                    const s3 = slots[Math.floor(Math.random() * slots.length)];
-
-                    let mult = 0;
-                    if (s1 === '🐯' && s2 === '🐯' && s3 === '🐯') mult = 10;
-                    else if (s1 === s2 && s2 === s3) mult = 5;
-                    else if (s1 === s2 || s2 === s3 || s1 === s3) mult = 1.5;
-
-                    if (mult > 0) {
-                        const total = Math.floor(aposta * mult);
-                        const lucro = total - aposta;
-                        user.carteira += lucro;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `🎰 [ ${s1} | ${s2} | ${s3} ]\n\n🎉 *SOLTOU A CARTA! (${mult}x)*\n📈 Lucro: *+${lucro} PydaCoins*\n👛 Saldo: *${user.carteira}*` }, { quoted: msg });
-                    } else {
-                        user.carteira -= aposta;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `🎰 [ ${s1} | ${s2} | ${s3} ]\n\n❌ *PERDEU!*\n📉 Prejuízo: *-${aposta} PydaCoins*\n👛 Saldo: *${user.carteira}*` }, { quoted: msg });
-                    }
+                case 'curar': {
+                    if (user.carteira < 50) return await sock.sendMessage(from, { text: '❌ Você precisa de R$ 50 na carteira para se curar.' }, { quoted: msg });
+                    user.carteira -= 50;
+                    user.hp = 100;
+                    saveDB(db);
+                    await sock.sendMessage(from, { text: `💊 Você usou uma poção de cura e seu HP voltou para 100!` }, { quoted: msg });
                     break;
                 }
 
-                case 'roleta': {
-                    const escolha = args[0]?.toLowerCase();
-                    const aposta = parseInt(args[1]);
-
-                    if (!escolha || !aposta || isNaN(aposta) || aposta <= 0) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.roleta [vermelho/preto/0-36] [aposta]`' }, { quoted: msg });
-                        break;
+                // ==================== JOGOS & CASSINO ====================
+                case 'daily': {
+                    const now = Date.now();
+                    const cooldown = 86400000;
+                    if (now - user.dailyCooldown < cooldown) {
+                        const remaining = Math.ceil((cooldown - (now - user.dailyCooldown)) / 3600000);
+                        return await sock.sendMessage(from, { text: `⏳ Bônus já resgatado! Volte em ${remaining} horas.` }, { quoted: msg });
                     }
-                    if (user.carteira < aposta) {
-                        await sock.sendMessage(from, { text: '⚠️ Saldo insuficiente!' }, { quoted: msg });
-                        break;
-                    }
-
-                    const numSorteado = Math.floor(Math.random() * 37);
-                    const corSorteada = numSorteado === 0 ? 'verde' : (numSorteado % 2 === 0 ? 'preto' : 'vermelho');
-
-                    let ganhou = false;
-                    let mult = 0;
-
-                    if (escolha === corSorteada) {
-                        ganhou = true;
-                        mult = 2;
-                    } else if (parseInt(escolha) === numSorteado) {
-                        ganhou = true;
-                        mult = 14;
-                    }
-
-                    if (ganhou) {
-                        const total = aposta * mult;
-                        const lucro = total - aposta;
-                        user.carteira += lucro;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `🎯 Roleta: *${numSorteado} (${corSorteada.toUpperCase()})*\n\n✅ *GANHOU!*\n📈 Lucro: *+${lucro}*\n👛 Saldo: *${user.carteira}*` }, { quoted: msg });
-                    } else {
-                        user.carteira -= aposta;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `🎯 Roleta: *${numSorteado} (${corSorteada.toUpperCase()})*\n\n❌ *PERDEU!*\n📉 Prejuízo: *-${aposta}*\n👛 Saldo: *${user.carteira}*` }, { quoted: msg });
-                    }
+                    user.carteira += 500;
+                    user.dailyCooldown = now;
+                    saveDB(db);
+                    await sock.sendMessage(from, { text: `🎁 *Prêmio Diário!* Você ganhou R$ 500 moedas.` }, { quoted: msg });
                     break;
                 }
 
-                case 'blackjack':
-                case '21': {
-                    const aposta = parseInt(args[0]);
-                    if (!aposta || isNaN(aposta) || aposta <= 0) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.21 [aposta]`' }, { quoted: msg });
-                        break;
-                    }
-                    if (user.carteira < aposta) {
-                        await sock.sendMessage(from, { text: '⚠️ Saldo insuficiente!' }, { quoted: msg });
-                        break;
-                    }
-
-                    const voce = Math.floor(Math.random() * 6) + 15;
-                    const bot = Math.floor(Math.random() * 7) + 15;
-
-                    if (voce > bot) {
-                        user.carteira += aposta;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `🃏 *21 RÁPIDO*\n\n👤 Suas cartas: *${voce}*\n🤖 Pyda: *${bot}*\n\n✅ *VENCEU!*\n📈 Lucro: *+${aposta}*\n👛 Saldo: *${user.carteira}*` }, { quoted: msg });
-                    } else if (voce < bot) {
-                        user.carteira -= aposta;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `🃏 *21 RÁPIDO*\n\n👤 Suas cartas: *${voce}*\n🤖 Pyda: *${bot}*\n\n❌ *PERDEU!*\n📉 Prejuízo: *-${aposta}*\n👛 Saldo: *${user.carteira}*` }, { quoted: msg });
-                    } else {
-                        await sock.sendMessage(from, { text: `🃏 EMPATE! (*${voce}* x *${bot}*) Aposta devolvida.` }, { quoted: msg });
-                    }
+                case 'dado': {
+                    const num = Math.floor(Math.random() * 6) + 1;
+                    await sock.sendMessage(from, { text: `🎲 Você jogou o dado e tirou: *${num}*` }, { quoted: msg });
                     break;
                 }
 
                 case 'caraoucoroa': {
                     const escolha = args[0]?.toLowerCase();
                     const aposta = parseInt(args[1]);
-
-                    if ((escolha !== 'cara' && escolha !== 'coroa') || !aposta || isNaN(aposta) || aposta <= 0) {
-                        await sock.sendMessage(from, { text: '⚠️ Uso: `.caraoucoroa [cara/coroa] [aposta]`' }, { quoted: msg });
-                        break;
+                    if (!['cara', 'coroa'].includes(escolha) || isNaN(aposta) || aposta <= 0) {
+                        return await sock.sendMessage(from, { text: '⚠️ Uso correto: `.caraoucoroa [cara/coroa] [aposta]`' }, { quoted: msg });
                     }
-                    if (user.carteira < aposta) {
-                        await sock.sendMessage(from, { text: '⚠️ Saldo insuficiente!' }, { quoted: msg });
-                        break;
-                    }
+                    if (user.carteira < aposta) return await sock.sendMessage(from, { text: '❌ Saldo insuficiente.' }, { quoted: msg });
 
-                    const resultado = Math.random() < 0.5 ? 'cara' : 'coroa';
+                    const resultado = Math.random() > 0.5 ? 'cara' : 'coroa';
                     if (escolha === resultado) {
                         user.carteira += aposta;
+                        user.vitorias += 1;
                         saveDB(db);
-                        await sock.sendMessage(from, { text: `🪙 Resultado: *${resultado.toUpperCase()}*\n\n✅ *ACERTOU!*\n📈 Lucro: *+${aposta}*\n👛 Saldo: *${user.carteira}*` }, { quoted: msg });
+                        await sock.sendMessage(from, { text: `🪙 Deu *${resultado.toUpperCase()}*! Você venceu e ganhou R$ ${aposta}!` }, { quoted: msg });
                     } else {
                         user.carteira -= aposta;
                         saveDB(db);
-                        await sock.sendMessage(from, { text: `🪙 Resultado: *${resultado.toUpperCase()}*\n\n❌ *ERROU!*\n📉 Prejuízo: *-${aposta}*\n👛 Saldo: *${user.carteira}*` }, { quoted: msg });
+                        await sock.sendMessage(from, { text: `🪙 Deu *${resultado.toUpperCase()}*! Você perdeu R$ ${aposta}.` }, { quoted: msg });
                     }
                     break;
                 }
 
-                // ==================== OUTROS COMANDOS ====================
-                case 'trabalhar': {
-                    const agora = Date.now();
-                    if (agora < user.trabalhoCooldown) {
-                        const min = Math.ceil((user.trabalhoCooldown - agora) / 60000);
-                        await sock.sendMessage(from, { text: `⏳ Aguarde *${min} min* para trabalhar.` }, { quoted: msg });
-                        break;
+                case 'tigrinho':
+                case 'foguete': {
+                    const aposta = parseInt(args[0]);
+                    if (isNaN(aposta) || aposta <= 0) return await sock.sendMessage(from, { text: '⚠️ Digite o valor da aposta. Ex: `.tigrinho 50`' }, { quoted: msg });
+                    if (user.carteira < aposta) return await sock.sendMessage(from, { text: '❌ Saldo insuficiente na carteira.' }, { quoted: msg });
+
+                    const venceu = Math.random() > 0.6;
+                    if (venceu) {
+                        const premio = aposta * 2;
+                        user.carteira += premio;
+                        saveDB(db);
+                        await sock.sendMessage(from, { text: `🎰 🚀 *LUCKY WIN!* Você apostou R$ ${aposta} e multiplicou para *R$ ${premio}*!` }, { quoted: msg });
+                    } else {
+                        user.carteira -= aposta;
+                        saveDB(db);
+                        await sock.sendMessage(from, { text: `💥 *CRASH!* Você perdeu a aposta de R$ ${aposta}.` }, { quoted: msg });
                     }
-                    const ganho = Math.floor(Math.random() * 250) + 50;
-                    user.carteira += ganho;
-                    user.trabalhoCooldown = agora + (15 * 60 * 1000);
-                    saveDB(db);
-                    await sock.sendMessage(from, { text: `🔨 Trabalhou e ganhou *${ganho} PydaCoins*!` }, { quoted: msg });
                     break;
                 }
 
-                case 'saldo':
-                    await sock.sendMessage(from, { text: `💳 Carteira: *${user.carteira}*\n🏦 Banco: *${user.banco}*\n❤️ HP: *${user.hp}/100*` }, { quoted: msg });
+                // ==================== PERFIL & RANKING ====================
+                case 'perfil': {
+                    const status = `
+╭━━━「 👤 PERFIL DO USUÁRIO 」━━━╮
+┃
+┃ 📛 *Nome:* ${user.nome}
+┃ 💰 *Carteira:* R$ ${user.carteira}
+┃ 🏦 *Banco:* R$ ${user.banco}
+┃ ❤️ *HP:* ${user.hp}/100
+┃ ⭐ *XP Total:* ${user.xp}
+┃ 🏆 *Nível:* ${user.nivel}
+┃ 🎮 *Partidas:* ${user.jogos}
+┃ 🥇 *Vitórias:* ${user.vitorias}
+┃ ⚠️ *Advertências:* ${user.warnings}/3
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
+                    await sock.sendMessage(from, { text: status }, { quoted: msg });
                     break;
+                }
 
-                case 'ping':
-                    await sock.sendMessage(from, { text: '🏓 Pong! Pyda Online!' }, { quoted: msg });
+                case 'rank': {
+                    const allUsers = Object.keys(db.users)
+                        .map(k => ({ id: k, ...db.users[k] }))
+                        .sort((a, b) => b.xp - a.xp)
+                        .slice(0, 10);
+
+                    let rankMsg = `🏆 *RANKING DO GRUPO*\n─────────────────────\n`;
+                    allUsers.forEach((u, idx) => {
+                        const pos = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `${idx + 1}.`;
+                        rankMsg += `${pos} *${u.nome}* — Lv. ${u.nivel} (${u.xp} XP)\n`;
+                    });
+                    await sock.sendMessage(from, { text: rankMsg.trim() }, { quoted: msg });
                     break;
+                }
 
-                case 'dono':
-                    await sock.sendMessage(from, { text: '👑 Criador: *Odin*' }, { quoted: msg });
+                // ==================== MODERAÇÃO & ADM ====================
+                case 'ban':
+                case 'kick': {
+                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Funciona apenas em grupos.' }, { quoted: msg });
+                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque o membro a ser removido.' }, { quoted: msg });
+
+                    try {
+                        await sock.groupParticipantsUpdate(from, [mentioned], 'remove');
+                        await sock.sendMessage(from, { text: `🚨 @${mentioned.split('@')[0]} foi removido!`, mentions: [mentioned] }, { quoted: msg });
+                    } catch {
+                        await sock.sendMessage(from, { text: '❌ Erro! Verifique as permissões de ADM do bot.' }, { quoted: msg });
+                    }
                     break;
+                }
 
-                case 'dado':
-                    await sock.sendMessage(from, { text: `🎲 Número: *${Math.floor(Math.random() * 6) + 1}*` }, { quoted: msg });
+                case 'promover': {
+                    if (!isGroup) return;
+                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque quem deseja promover.' }, { quoted: msg });
+                    await sock.groupParticipantsUpdate(from, [mentioned], 'promote');
+                    await sock.sendMessage(from, { text: `👑 Promovido a Administrador!` }, { quoted: msg });
                     break;
+                }
 
-                case 'revelar':
-                case 'r': {
-                    const quotedMsg = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
-                    if (!quotedMsg) break;
-                    const viewOnceMsg = quotedMsg.viewOnceMessageV2?.message || quotedMsg.viewOnceMessage?.message || quotedMsg;
-                    const mediaType = viewOnceMsg.imageMessage ? 'image' : viewOnceMsg.videoMessage ? 'video' : null;
-                    if (!mediaType) break;
+                case 'rebaixar': {
+                    if (!isGroup) return;
+                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque quem deseja rebaixar.' }, { quoted: msg });
+                    await sock.groupParticipantsUpdate(from, [mentioned], 'demote');
+                    await sock.sendMessage(from, { text: `📉 Rebaixado de Administrador.` }, { quoted: msg });
+                    break;
+                }
 
-                    const mediaMessage = mediaType === 'image' ? viewOnceMsg.imageMessage : viewOnceMsg.videoMessage;
-                    const stream = await downloadContentFromMessage(mediaMessage, mediaType);
-                    let buffer = Buffer.alloc(0);
-                    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+                case 'warn': {
+                    if (!isGroup) return;
+                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque o membro.' }, { quoted: msg });
 
-                    await sock.sendMessage(from, { [mediaType]: buffer, caption: '🔓 *Revelado!*' }, { quoted: msg });
+                    const targetUser = getUser(db, mentioned);
+                    targetUser.warnings += 1;
+                    
+                    if (targetUser.warnings >= 3) {
+                        targetUser.warnings = 0;
+                        saveDB(db);
+                        await sock.sendMessage(from, { text: `🚨 @${mentioned.split('@')[0]} atingiu 3 advertências e foi removido!`, mentions: [mentioned] });
+                        await sock.groupParticipantsUpdate(from, [mentioned], 'remove');
+                    } else {
+                        saveDB(db);
+                        await sock.sendMessage(from, { text: `⚠️ Advertência aplicada! (${targetUser.warnings}/3)`, mentions: [mentioned] });
+                    }
+                    break;
+                }
+
+                case 'warnings': {
+                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || sender;
+                    const targetUser = getUser(db, mentioned);
+                    await sock.sendMessage(from, { text: `📋 O usuário possui *${targetUser.warnings}/3* advertências.` }, { quoted: msg });
+                    break;
+                }
+
+                case 'grupo': {
+                    if (!isGroup) return;
+                    const action = args[0]?.toLowerCase();
+                    if (action === 'fechar') {
+                        await sock.groupSettingUpdate(from, 'announcement');
+                        await sock.sendMessage(from, { text: '🔒 Grupo fechado!' }, { quoted: msg });
+                    } else if (action === 'abrir') {
+                        await sock.groupSettingUpdate(from, 'not_announcement');
+                        await sock.sendMessage(from, { text: '🔓 Grupo aberto!' }, { quoted: msg });
+                    }
+                    break;
+                }
+
+                case 'marcartodos': {
+                    if (!isGroup) return;
+                    const groupMetadata = await sock.groupMetadata(from);
+                    const participants = groupMetadata.participants.map(p => p.id);
+                    await sock.sendMessage(from, { text: `📢 *CHAMADA GERAL*\n\n` + participants.map(p => `@${p.split('@')[0]}`).join(' '), mentions: participants });
+                    break;
+                }
+
+                case 'apagar': {
+                    const quotedMsgKey = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
+                    const participant = msg.message?.extendedTextMessage?.contextInfo?.participant;
+                    if (!quotedMsgKey) return await sock.sendMessage(from, { text: '⚠️ Responda à mensagem que deseja apagar.' }, { quoted: msg });
+                    await sock.sendMessage(from, { delete: { remoteJid: from, fromMe: false, id: quotedMsgKey, participant } });
+                    break;
+                }
+
+                // ==================== FIGURINHAS ====================
+                case 's':
+                case 'sticker':
+                case 'fig': {
+                    const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+                    const isMedia = msg.message?.imageMessage || msg.message?.videoMessage;
+                    const isQuotedMedia = quotedMsg?.imageMessage || quotedMsg?.videoMessage;
+                    if (!isMedia && !isQuotedMedia) return await sock.sendMessage(from, { text: '⚠️ Envie ou responda a uma foto ou vídeo.' }, { quoted: msg });
+
+                    const mediaMessage = isMedia ? (msg.message.imageMessage || msg.message.videoMessage) : (quotedMsg.imageMessage || quotedMsg.videoMessage);
+                    const isVideo = !!(msg.message?.videoMessage || quotedMsg?.videoMessage);
+                    
+                    await sock.sendMessage(from, { text: '⏳ Gerando sticker...' }, { quoted: msg });
+                    try {
+                        const stream = await downloadContentFromMessage(mediaMessage, isVideo ? 'video' : 'image');
+                        let buffer = Buffer.alloc(0);
+                        for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+
+                        const tempInput = path.join(__dirname, `temp_${Date.now()}.${isVideo ? 'mp4' : 'jpg'}`);
+                        const tempOutput = path.join(__dirname, `temp_${Date.now()}.webp`);
+                        fs.writeFileSync(tempInput, buffer);
+
+                        ffmpeg(tempInput)
+                            .outputOptions(['-vcodec libwebp', '-vf scale=\'min(320,iw)\':\'min(320,ih)\':force_original_aspect_ratio=decrease,fps=15,pad=320:320:(320-iw)/2:(320-ih)/2:color=0x00000000'])
+                            .toFormat('webp')
+                            .save(tempOutput)
+                            .on('end', async () => {
+                                await sock.sendMessage(from, { sticker: fs.readFileSync(tempOutput) }, { quoted: msg });
+                                if (fs.existsSync(tempInput)) fs.unlinkSync(tempInput);
+                                if (fs.existsSync(tempOutput)) fs.unlinkSync(tempOutput);
+                            })
+                            .on('error', () => {
+                                sock.sendMessage(from, { text: '❌ Erro ao converter arquivo de mídia.' }, { quoted: msg });
+                            });
+                    } catch {
+                        await sock.sendMessage(from, { text: '❌ Falha ao baixar mídia.' }, { quoted: msg });
+                    }
+                    break;
+                }
+
+                case 'ttp':
+                case 'attp': {
+                    const text = args.join(' ');
+                    if (!text) return await sock.sendMessage(from, { text: '⚠️ Digite o texto.' }, { quoted: msg });
+                    try {
+                        const imgUrl = `https://dummyimage.com/512x512/000000/fff.png&text=${encodeURIComponent(text)}`;
+                        const res = await axios.get(imgUrl, { responseType: 'arraybuffer' });
+                        const tempInput = path.join(__dirname, `temp_${Date.now()}.png`);
+                        const tempOutput = path.join(__dirname, `temp_${Date.now()}.webp`);
+                        fs.writeFileSync(tempInput, res.data);
+
+                        ffmpeg(tempInput)
+                            .outputOptions(['-vcodec libwebp', '-vf scale=320:320'])
+                            .toFormat('webp')
+                            .save(tempOutput)
+                            .on('end', async () => {
+                                await sock.sendMessage(from, { sticker: fs.readFileSync(tempOutput) }, { quoted: msg });
+                                if (fs.existsSync(tempInput)) fs.unlinkSync(tempInput);
+                                if (fs.existsSync(tempOutput)) fs.unlinkSync(tempOutput);
+                            });
+                    } catch {
+                        await sock.sendMessage(from, { text: '❌ Erro ao gerar texto em sticker.' }, { quoted: msg });
+                    }
+                    break;
+                }
+
+                // ==================== FERRAMENTAS & OSINT ====================
+                case 'qrcode': {
+                    const text = args.join(' ');
+                    if (!text) return await sock.sendMessage(from, { text: '⚠️ Digite um texto/link.' }, { quoted: msg });
+                    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(text)}`;
+                    await sock.sendMessage(from, { image: { url: qrUrl }, caption: `✅ QR Code Gerado!` }, { quoted: msg });
+                    break;
+                }
+
+                case 'clima': {
+                    const cidade = args.join(' ');
+                    if (!cidade) return await sock.sendMessage(from, { text: '⚠️ Digite a cidade.' }, { quoted: msg });
+                    try {
+                        const res = await axios.get(`https://wttr.in/${encodeURIComponent(cidade)}?format=3`);
+                        await sock.sendMessage(from, { text: `🌤️ *Clima:* ${res.data}` }, { quoted: msg });
+                    } catch {
+                        await sock.sendMessage(from, { text: '❌ Erro ao obter dados do clima.' }, { quoted: msg });
+                    }
+                    break;
+                }
+
+                case 'search': {
+                    const query = args.join(' ');
+                    if (!query) return await sock.sendMessage(from, { text: '⚠️ Digite o termo de pesquisa.' }, { quoted: msg });
+                    try {
+                        const url = `https://serpapi.com/search.json?q=${encodeURIComponent(query)}&engine=google&hl=pt-br&gl=br&api_key=${SERPAPI_KEY}`;
+                        const res = await axios.get(url);
+                        const results = res.data.organic_results;
+                        if (!results || results.length === 0) return await sock.sendMessage(from, { text: '❌ Nenhum resultado encontrado.' }, { quoted: msg });
+
+                        let resposta = `🔎 *RESULTADOS DA PESQUISA:*\n\n`;
+                        results.slice(0, 4).forEach((item, index) => {
+                            resposta += `*${index+1}. ${item.title}*\n🔗 ${item.link}\n\n`;
+                        });
+                        await sock.sendMessage(from, { text: resposta }, { quoted: msg });
+                    } catch {
+                        await sock.sendMessage(from, { text: '❌ Erro ao pesquisar no Google.' }, { quoted: msg });
+                    }
+                    break;
+                }
+
+                case 'ip': {
+                    const target = args[0];
+                    if (!target) return await sock.sendMessage(from, { text: '⚠️ Digite o IP.' }, { quoted: msg });
+                    try {
+                        const res = await axios.get(`http://ip-api.com/json/${target}`);
+                        const info = `🌐 *IP:* ${res.data.query}\n🏳️ *País:* ${res.data.country}\n🏙️ *Cidade:* ${res.data.city}\n🏢 *ISP:* ${res.data.isp}`;
+                        await sock.sendMessage(from, { text: info }, { quoted: msg });
+                    } catch { await sock.sendMessage(from, { text: '❌ Erro ao consultar IP.' }, { quoted: msg }); }
+                    break;
+                }
+
+                case 'ping': {
+                    await sock.sendMessage(from, { text: '🏓 *Pong!* Pyda Bot v4.0 Ativo!' }, { quoted: msg });
                     break;
                 }
 
                 default:
-                    commandFound = false;
                     break;
-            }
-
-            // AVISO DE COMANDO INEXISTENTE
-            if (!commandFound) {
-                await sock.sendMessage(from, { 
-                    text: `❓ *Comando não encontrado!*\n\nO comando \`.${command}\` não existe.\nDigite *.menu* para ver os comandos disponíveis.` 
-                }, { quoted: msg });
             }
         }
     });
