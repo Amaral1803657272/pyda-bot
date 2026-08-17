@@ -1,912 +1,3984 @@
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    DisconnectReason, 
-    downloadContentFromMessage 
+'use strict';
+
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    downloadContentFromMessage,
+    makeCacheableSignalKeyStore,
+    fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
+
 const pino = require('pino');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const ffmpeg = require('fluent-ffmpeg');
-const exifParser = require('exif-parser');
+const crypto = require('crypto');
+
+require('dotenv').config();
+
+// ============================================================
+// CONFIGURAÇÕES
+// ============================================================
+
+const PREFIX = '.';
+const BOT_NAME = 'Pyda Bot';
+const BOT_VERSION = '5.0.0';
+
+const BOT_LOGO_URL =
+    'https://i.postimg.cc/gc7hhDcF/file-00000000e328820e9000f592feb5a047.png';
+
+const AUTH_DIR = path.join(__dirname, 'auth_info_baileys');
+const DB_FILE = path.join(__dirname, 'database.json');
+const DB_BACKUP = path.join(__dirname, 'database.backup.json');
+
+const OWNER_NUMBER = String(process.env.OWNER_NUMBER || '')
+    .replace(/\D/g, '');
+
+const PHONE_NUMBER = String(process.env.PHONE_NUMBER || '')
+    .replace(/\D/g, '');
+
+const SERPAPI_KEY = String(process.env.SERPAPI_KEY || '');
+
+const logger = pino({
+    level: process.env.LOG_LEVEL || 'silent'
+});
+
+// ============================================================
+// READLINE
+// ============================================================
 
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
 });
-const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
-// Foto oficial do menu e Chave do SerpApi
-const BOT_LOGO_URL = 'https://i.postimg.cc/gc7hhDcF/file-00000000e328820e9000f592feb5a047.png';
-const SERPAPI_KEY = '620a2024ca25d90d361ce248a15d6c2ca740ae0687ce3e8d95eccdac14d6ce7e';
+const question = (text) =>
+    new Promise((resolve) => rl.question(text, resolve));
 
-// Banco de Dados Local
-const DB_FILE = './database.json';
-if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify({ users: {}, groups: {}, autoresponder: {} }, null, 2));
+// ============================================================
+// BANCO DE DADOS
+// ============================================================
+
+const DEFAULT_DB = {
+    users: {},
+    groups: {},
+    autoresponder: {}
+};
+
+function ensureDatabase() {
+    if (!fs.existsSync(DB_FILE)) {
+        fs.writeFileSync(
+            DB_FILE,
+            JSON.stringify(DEFAULT_DB, null, 2),
+            'utf8'
+        );
+    }
 }
 
 function loadDB() {
-    let data = JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
-    if (!data.users) data.users = {};
-    if (!data.groups) data.groups = {};
-    if (!data.autoresponder) data.autoresponder = {};
-    return data;
+    ensureDatabase();
+
+    try {
+        const raw = fs.readFileSync(DB_FILE, 'utf8');
+        const data = JSON.parse(raw);
+
+        return {
+            users: data.users || {},
+            groups: data.groups || {},
+            autoresponder: data.autoresponder || {}
+        };
+    } catch (error) {
+        console.error('❌ Erro ao carregar database.json:', error.message);
+
+        try {
+            if (fs.existsSync(DB_FILE)) {
+                fs.copyFileSync(DB_FILE, DB_BACKUP);
+                console.log('💾 Backup do banco criado.');
+            }
+        } catch (backupError) {
+            console.error(
+                '❌ Erro ao criar backup:',
+                backupError.message
+            );
+        }
+
+        return {
+            users: {},
+            groups: {},
+            autoresponder: {}
+        };
+    }
 }
 
-function saveDB(data) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+function saveDB(db) {
+    try {
+        const tempFile = `${DB_FILE}.tmp`;
+
+        fs.writeFileSync(
+            tempFile,
+            JSON.stringify(db, null, 2),
+            'utf8'
+        );
+
+        fs.renameSync(tempFile, DB_FILE);
+
+        return true;
+    } catch (error) {
+        console.error(
+            '❌ Erro ao salvar database:',
+            error.message
+        );
+
+        return false;
+    }
 }
 
-function getUser(db, sender, name = 'Usuário') {
-    if (!db.users[sender]) {
-        db.users[sender] = {
-            nome: name,
+// ============================================================
+// UTILITÁRIOS
+// ============================================================
+
+function normalizeJid(jid) {
+    if (!jid) return '';
+
+    return String(jid)
+        .replace(/:\d+(?=@)/, '');
+}
+
+function getNumberFromJid(jid) {
+    return normalizeJid(jid)
+        .split('@')[0]
+        .replace(/\D/g, '');
+}
+
+function isOwner(jid) {
+    if (!OWNER_NUMBER) return false;
+
+    return getNumberFromJid(jid) === OWNER_NUMBER;
+}
+
+function formatMoney(value) {
+    const number = Number(value) || 0;
+
+    return number.toLocaleString('pt-BR', {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 2
+    });
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function randomInt(min, max) {
+    return Math.floor(
+        Math.random() * (max - min + 1)
+    ) + min;
+}
+
+function generatePassword(length = 12) {
+    const chars =
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ' +
+        'abcdefghijklmnopqrstuvwxyz' +
+        '0123456789' +
+        '!@#$%^&*()_+-=';
+
+    let password = '';
+
+    for (let i = 0; i < length; i++) {
+        const index = crypto.randomInt(0, chars.length);
+        password += chars[index];
+    }
+
+    return password;
+}
+
+function getBody(message) {
+    if (!message) return '';
+
+    return (
+        message.conversation ||
+        message.extendedTextMessage?.text ||
+        message.imageMessage?.caption ||
+        message.videoMessage?.caption ||
+        message.documentMessage?.caption ||
+        message.buttonsResponseMessage?.selectedButtonId ||
+        message.listResponseMessage?.singleSelectReply?.selectedRowId ||
+        message.templateButtonReplyMessage?.selectedId ||
+        ''
+    );
+}
+
+function getQuotedMessage(msg) {
+    return (
+        msg.message?.extendedTextMessage?.contextInfo
+            ?.quotedMessage || null
+    );
+}
+
+function getQuotedParticipant(msg) {
+    return (
+        msg.message?.extendedTextMessage?.contextInfo
+            ?.participant || null
+    );
+}
+
+function getMentionedJid(msg) {
+    return (
+        msg.message?.extendedTextMessage?.contextInfo
+            ?.mentionedJid?.[0] || null
+    );
+}
+
+function getTargetJid(msg) {
+    return getMentionedJid(msg) || getQuotedParticipant(msg);
+}
+
+// ============================================================
+// USUÁRIO
+// ============================================================
+
+function getUser(db, jid, name = 'Usuário') {
+    const id = normalizeJid(jid);
+
+    if (!db.users[id]) {
+        db.users[id] = {
+            nome: name || 'Usuário',
             carteira: 200,
             banco: 0,
+
             xp: 0,
             nivel: 1,
+
             hp: 100,
+
             jogos: 0,
             vitorias: 0,
+
             dailyCooldown: 0,
             workCooldown: 0,
+
             warnings: 0
         };
     }
-    db.users[sender].nome = name;
-    if (db.users[sender].hp === undefined) db.users[sender].hp = 100;
-    return db.users[sender];
+
+    const user = db.users[id];
+
+    user.nome = name || user.nome || 'Usuário';
+
+    if (typeof user.carteira !== 'number') {
+        user.carteira = 200;
+    }
+
+    if (typeof user.banco !== 'number') {
+        user.banco = 0;
+    }
+
+    if (typeof user.xp !== 'number') {
+        user.xp = 0;
+    }
+
+    if (typeof user.nivel !== 'number') {
+        user.nivel = 1;
+    }
+
+    if (typeof user.hp !== 'number') {
+        user.hp = 100;
+    }
+
+    if (typeof user.jogos !== 'number') {
+        user.jogos = 0;
+    }
+
+    if (typeof user.vitorias !== 'number') {
+        user.vitorias = 0;
+    }
+
+    if (typeof user.warnings !== 'number') {
+        user.warnings = 0;
+    }
+
+    if (typeof user.dailyCooldown !== 'number') {
+        user.dailyCooldown = 0;
+    }
+
+    if (typeof user.workCooldown !== 'number') {
+        user.workCooldown = 0;
+    }
+
+    return user;
 }
+
+// ============================================================
+// XP
+// ============================================================
 
 function addXP(user, amount) {
-    user.xp += amount;
-    const nextLevel = user.nivel * 100;
-    if (user.xp >= nextLevel) {
-        user.nivel += 1;
-        return true;
+    const gained = Math.max(0, Number(amount) || 0);
+
+    user.xp += gained;
+
+    let levels = 0;
+
+    while (user.xp >= user.nivel * 100) {
+        user.nivel++;
+        levels++;
     }
-    return false;
+
+    return levels;
 }
 
-async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+// ============================================================
+// ADMINISTRAÇÃO DE GRUPO
+// ============================================================
 
-    const sock = makeWASocket({
-        logger: pino({ level: 'silent' }),
-        auth: state,
-        printQRInTerminal: false
+async function getGroupMetadata(sock, jid) {
+    try {
+        return await sock.groupMetadata(jid);
+    } catch (error) {
+        console.error(
+            '❌ Erro ao obter metadados do grupo:',
+            error.message
+        );
+
+        return null;
+    }
+}
+
+function isAdmin(metadata, jid) {
+    if (!metadata || !jid) return false;
+
+    const normalized = normalizeJid(jid);
+
+    return metadata.participants.some(participant => {
+        return (
+            normalizeJid(participant.id) === normalized &&
+            (
+                participant.admin === 'admin' ||
+                participant.admin === 'superadmin' ||
+                participant.admin === true
+            )
+        );
     });
+}
 
-    sock.ev.on('creds.update', saveCreds);
+function getBotJid(sock) {
+    return normalizeJid(sock.user?.id || '');
+}
 
-    if (!sock.authState.creds.registered) {
+function isBotAdmin(metadata, sock) {
+    return isAdmin(metadata, getBotJid(sock));
+}
+
+// ============================================================
+// DOWNLOAD DE MÍDIA
+// ============================================================
+
+async function downloadMedia(message, type) {
+    const stream = await downloadContentFromMessage(
+        message,
+        type
+    );
+
+    const chunks = [];
+
+    for await (const chunk of stream) {
+        chunks.push(chunk);
+    }
+
+    return Buffer.concat(chunks);
+}
+
+// ============================================================
+// CONEXÃO
+// ============================================================
+
+let reconnecting = false;
+
+async function connectToWhatsApp() {
+    if (reconnecting) return;
+
+    reconnecting = false;
+
+    ensureDatabase();
+
+    console.log('\n======================================');
+    console.log(`🤖 ${BOT_NAME} v${BOT_VERSION}`);
+    console.log('======================================');
+
+    const {
+        state,
+        saveCreds
+    } = await useMultiFileAuthState(AUTH_DIR);
+
+    let version;
+
+    try {
+        const latest = await fetchLatestBaileysVersion();
+        version = latest.version;
+
+        console.log(
+            `📦 Baileys: ${version.join('.')}`
+        );
+    } catch {
+        console.log(
+            '⚠️ Não foi possível consultar a versão do Baileys.'
+        );
+    }
+
+    const socketOptions = {
+        logger,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(
+                state.keys,
+                logger
+            )
+        },
+        browser: [
+            'Pyda Bot',
+            'Chrome',
+            '1.0.0'
+        ],
+        markOnlineOnConnect: false,
+        generateHighQualityLinkPreview: false,
+        syncFullHistory: false
+    };
+
+    if (version) {
+        socketOptions.version = version;
+    }
+
+    const sock = makeWASocket(socketOptions);
+
+    sock.ev.on(
+        'creds.update',
+        saveCreds
+    );
+
+    // ========================================================
+    // PAREAMENTO
+    // ========================================================
+
+    if (!state.creds.registered) {
         console.log('\n--- AUTENTICAÇÃO ---');
-        let phoneNumber = await question('Número (com DDD): ');
-        phoneNumber = phoneNumber.replace(/[^0-9]/g, '');
-        if (phoneNumber) {
-            setTimeout(async () => {
-                const code = await sock.requestPairingCode(phoneNumber);
-                console.log(`\n🔑 CÓDIGO DE PAREAMENTO: \x1b[32m${code}\x1b[0m\n`);
-            }, 3000);
+
+        let phoneNumber = PHONE_NUMBER;
+
+        if (!phoneNumber) {
+            phoneNumber = await question(
+                'Digite o número com DDD: '
+            );
+
+            phoneNumber = phoneNumber
+                .replace(/\D/g, '');
+        }
+
+        if (!phoneNumber) {
+            console.log(
+                '❌ Número inválido.'
+            );
+
+            process.exit(1);
+        }
+
+        try {
+            await sleep(3000);
+
+            const code =
+                await sock.requestPairingCode(
+                    phoneNumber
+                );
+
+            console.log(
+                `\n🔑 CÓDIGO DE PAREAMENTO: \x1b[32m${code}\x1b[0m\n`
+            );
+        } catch (error) {
+            console.error(
+                '❌ Erro ao gerar código:',
+                error.message
+            );
         }
     }
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
-        if (connection === 'open') {
-            console.log('\n✅ Pyda Bot v4.0 Conectado com Sucesso!');
-        } else if (connection === 'close') {
-            const reconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            if (reconnect) connectToWhatsApp();
-        }
-    });
+    // ========================================================
+    // CONNECTION UPDATE
+    // ========================================================
 
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
-        for (const msg of messages) {
-            if (!msg.message) continue;
-            const from = msg.key.remoteJid;
-            const isGroup = from.endsWith('@g.us');
+    sock.ev.on(
+        'connection.update',
+        async update => {
+            const {
+                connection,
+                lastDisconnect
+            } = update;
 
-            // Metadados GPS em Fotos
-            if (msg.message?.imageMessage) {
-                try {
-                    const stream = await downloadContentFromMessage(msg.message.imageMessage, 'image');
-                    let buffer = Buffer.alloc(0);
-                    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-                    const parser = exifParser.create(buffer);
-                    const result = parser.parse();
+            if (connection === 'open') {
+                reconnecting = false;
 
-                    if (result.tags.GPSLatitude) {
-                        const gps = `📍 *Metadados GPS Detectados!*\n─────────────────────\n🌐 Lat: ${result.tags.GPSLatitude}\n🌐 Long: ${result.tags.GPSLongitude}\n📸 Câmera: ${result.tags.Model || 'Desconhecido'}\n─────────────────────`;
-                        await sock.sendMessage(from, { text: gps }, { quoted: msg });
+                console.log(
+                    '\n✅ Pyda Bot conectado com sucesso!'
+                );
+
+                console.log(
+                    `🤖 Número: ${getNumberFromJid(getBotJid(sock))}`
+                );
+            }
+
+            if (connection === 'close') {
+                const statusCode =
+                    lastDisconnect?.error
+                        ?.output?.statusCode;
+
+                const shouldReconnect =
+                    statusCode !==
+                    DisconnectReason.loggedOut;
+
+                console.log(
+                    '\n⚠️ Conexão encerrada.'
+                );
+
+                console.log(
+                    `Código: ${statusCode || 'desconhecido'}`
+                );
+
+                if (shouldReconnect) {
+                    console.log(
+                        '🔄 Reconectando em 5 segundos...'
+                    );
+
+                    if (!reconnecting) {
+                        reconnecting = true;
+
+                        setTimeout(() => {
+                            connectToWhatsApp()
+                                .catch(error => {
+                                    reconnecting = false;
+
+                                    console.error(
+                                        '❌ Erro na reconexão:',
+                                        error.message
+                                    );
+                                });
+                        }, 5000);
                     }
-                } catch (e) { /* Sem EXIF */ }
-            }
-
-            const sender = msg.key.fromMe 
-                ? (sock.user?.id.split(':')[0] + '@s.whatsapp.net') 
-                : (msg.key.participant || msg.key.remoteJid);
-            const pushName = msg.pushName || 'Membro';
-
-            const body = msg.message.conversation || 
-                         msg.message.extendedTextMessage?.text || 
-                         msg.message.imageMessage?.caption || 
-                         msg.message.videoMessage?.caption || '';
-                         
-            const prefix = '.';
-            const db = loadDB();
-            const user = getUser(db, sender, pushName);
-            
-            const levelUp = addXP(user, 10);
-            if (levelUp) {
-                await sock.sendMessage(from, { text: `🎉 Parabéns @${sender.split('@')[0]}! Subiu para o *Nível ${user.nivel}*!`, mentions: [sender] });
-            }
-            saveDB(db);
-
-            const bodyTrimmed = body.trim();
-            const isCommand = bodyTrimmed.startsWith(prefix);
-
-            if (!isCommand) {
-                const chatAuto = db.autoresponder[from] || {};
-                const textLower = bodyTrimmed.toLowerCase();
-                if (chatAuto[textLower]) {
-                    await sock.sendMessage(from, { text: chatAuto[textLower] }, { quoted: msg });
+                } else {
+                    console.log(
+                        '🚪 Sessão encerrada. Será necessário autenticar novamente.'
+                    );
                 }
-                continue;
             }
+        }
+    );
 
-            const args = bodyTrimmed.slice(prefix.length).trim().split(/ +/);
-            const command = args.shift().toLowerCase();
+    // ========================================================
+    // MENSAGENS
+    // ========================================================
 
-            switch (command) {
-                case 'menu':
-                case 'ajuda': {
-                    const menuCaption = `
-╭━━━「 PYDA BOT v4.0 」━━━╮
+    sock.ev.on(
+        'messages.upsert',
+        async ({ messages, type }) => {
+            if (type !== 'notify') return;
+
+            for (const msg of messages) {
+                try {
+                    if (!msg?.message) continue;
+
+                    if (msg.key?.remoteJid === 'status@broadcast') {
+                        continue;
+                    }
+
+                    const from =
+                        msg.key?.remoteJid;
+
+                    if (!from) continue;
+
+                    const isGroup =
+                        from.endsWith('@g.us');
+
+                    const sender =
+                        normalizeJid(
+                            msg.key.fromMe
+                                ? getBotJid(sock)
+                                : (
+                                    msg.key.participant ||
+                                    from
+                                )
+                        );
+
+                    const pushName =
+                        msg.pushName ||
+                        'Membro';
+
+                    const body =
+                        getBody(msg.message);
+
+                    const bodyTrimmed =
+                        body.trim();
+
+                    const db = loadDB();
+
+                    // =========================================
+                    // REGISTRA GRUPO
+                    // =========================================
+
+                    if (isGroup) {
+                        if (!db.groups[from]) {
+                            db.groups[from] = {
+                                ativo: true,
+                                criadoEm: Date.now()
+                            };
+
+                            saveDB(db);
+                        }
+                    }
+
+                    // =========================================
+                    // USUÁRIO
+                    // =========================================
+
+                    const user =
+                        getUser(
+                            db,
+                            sender,
+                            pushName
+                        );
+
+                    const levels =
+                        addXP(user, 10);
+
+                    if (levels > 0 && isGroup) {
+                        const metadata =
+                            await getGroupMetadata(
+                                sock,
+                                from
+                            );
+
+                        if (
+                            metadata &&
+                            isBotAdmin(
+                                metadata,
+                                sock
+                            )
+                        ) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `🎉 Parabéns @${getNumberFromJid(sender)}!\n\n` +
+                                        `⭐ Você alcançou o *Nível ${user.nivel}*!`,
+                                    mentions: [
+                                        sender
+                                    ]
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+                        }
+                    }
+
+                    saveDB(db);
+
+                    // =========================================
+                    // AUTORESPONDER
+                    // =========================================
+
+                    if (
+                        !bodyTrimmed.startsWith(
+                            PREFIX
+                        )
+                    ) {
+                        const auto =
+                            db.autoresponder[from] ||
+                            {};
+
+                        const trigger =
+                            bodyTrimmed.toLowerCase();
+
+                        if (
+                            trigger &&
+                            auto[trigger]
+                        ) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text: auto[trigger]
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+                        }
+
+                        continue;
+                    }
+
+                    // =========================================
+                    // PARSE DO COMANDO
+                    // =========================================
+
+                    const commandLine =
+                        bodyTrimmed
+                            .slice(PREFIX.length)
+                            .trim();
+
+                    if (!commandLine) {
+                        continue;
+                    }
+
+                    const parts =
+                        commandLine.split(/\s+/);
+
+                    const command =
+                        parts.shift()
+                            .toLowerCase();
+
+                    const args = parts;
+
+                    // =========================================
+                    // SWITCH
+                    // =========================================
+
+                    switch (command) {
+
+                        // =====================================
+                        // MENU
+                        // =====================================
+
+                        case 'menu':
+                        case 'ajuda': {
+                            const menu =
+`╭━━━「 🤖 PYDA BOT 」━━━╮
 ┃
 ┃ 👤 Desenvolvedor: Odin
 ┃ 🤖 Status: Online
-┃ ⚙️ Prefixo: [ . ]
+┃ ⚙️ Prefixo: [ ${PREFIX} ]
 ┃
 ┣━━「 📚 CATEGORIAS 」━━
 ┃
 ┃ 👑 .menudono
-┃ ┣ Comandos do Criador
-┃
 ┃ 🛡️ .menuadm
-┃ ┣ Administração do Grupo
-┃
 ┃ 🤖 .menuauto
-┃ ┣ Automação & Respostas
-┃
 ┃ 🧰 .menumembro
-┃ ┣ Utilitários Rápidos
-┃
 ┃ 🎨 .menufig
-┃ ┣ Figurinhas & Mídia
-┃
 ┃ ⚔️ .menurpg
-┃ ┣ RPG & Economia
-┃
 ┃ 🎮 .menujogos
-┃ ┣ Jogos & Cassino
-┃
 ┃ 🧠 .menuia
-┃ ┣ Inteligência Artificial
-┃
-┃ 📥 .menudownload
-┃ ┣ Downloads
-┃
 ┃ 🛠️ .menuferramentas
-┃ ┣ Ferramentas & Utilidades
+┃ 🔎 .menuosint
 ┃
 ┃ 👤 .perfil
-┃ ┣ Seu Status & Moedas
-┃
-┃ 🏆 .rank
-┃ ┣ Ranking do Grupo
-┃
-┃ 🔎 .menuosint
-┃ ┣ Ferramentas OSINT
+┃ 🏓 .ping
 ┃
 ╰━━━━━━━━━━━━━━━━━━━━╯
-        💻 Pyda Systems v4.0`.trim();
-                    try {
-                        await sock.sendMessage(from, { image: { url: BOT_LOGO_URL }, caption: menuCaption }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: menuCaption }, { quoted: msg });
-                    }
-                    break;
-                }
+💻 Pyda Systems`;
 
-                case 'menudono': {
-                    const txt = `
-╭━━━「 👑 MENU DONO 」━━━╮
-┃
-┃ 📢 *.bc [texto]* - Transmissão Geral
-┃ 👤 *.dono* - Contato do Criador
-┃ ⚙️ *.restart* - Reiniciar Bot
-┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
+                            try {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        image: {
+                                            url: BOT_LOGO_URL
+                                        },
+                                        caption: menu
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+                            } catch {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text: menu
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+                            }
 
-                case 'menuauto': {
-                    const txt = `
-╭━━━「 🤖 AUTOMAÇÃO 」━━━╮
-┃
-┃ 💬 *.addauto [gatilho] | [resposta]*
-┃ ❌ *.delauto [gatilho]*
-┃ 📋 *.listauto*
-┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'menurpg': {
-                    const txt = `
-╭━━━「 ⚔️ RPG & ECONOMIA 」━━━╮
-┃
-┃ 💼 *.trabalhar* - Ganhe dinheiro
-┃ 💳 *.saldo* - Veja suas finanças
-┃ 🏦 *.depositar [valor]* - Guardar dinheiro
-┃ 🏧 *.sacar [valor]* - Retirar dinheiro
-┃ 🐉 *.dragao* - Enfrente o Dragão
-┃ 💊 *.curar* - Restaurar HP (R$ 50)
-┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'menujogos': {
-                    const txt = `
-╭━━━「 🎮 CASSINO & JOGOS 」━━━╮
-┃
-┃ 🚀 *.foguete [2x/3x] [aposta]*
-┃ 🎰 *.tigrinho [aposta]*
-┃ 🎯 *.roleta [cor] [aposta]*
-┃ 🃏 *.21 [aposta]*
-┃ 🪙 *.caraoucoroa [cara/coroa] [aposta]*
-┃ 🎲 *.dado*
-┃ 🎁 *.daily* - Bônus Diário
-┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'menumembro': {
-                    const txt = `
-╭━━━「 🧰 UTILITÁRIOS 」━━━╮
-┃
-┃ 🖼️ *.s* / *.fig* - Criar Sticker
-┃ 🔍 *.ping* - Testar Velocidade
-┃ 👁️ *.revelar* - Baixar Mídia Única
-┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'menuia': {
-                    const txt = `
-╭━━━「 🧠 INTELIGÊNCIA ARTIFICIAL 」━━━╮
-┃
-┃ 🤖 *.ia [pergunta]*
-┃ 💬 *.chat [mensagem]*
-┃ 📝 *.resuma [texto]*
-┃ 🌐 *.traduz [texto]*
-┃ 💻 *.codigo [pedido]*
-┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'menuadm': {
-                    const txt = `
-╭━━━「 🛡️ MENU ADM 」━━━╮
-┃
-┃ 📢 *.hidetag [texto]* - Marcação oculta
-┃ 🛑 *.ban* / *.kick [@membro]* - Banir membro
-┃ 👑 *.promover [@membro]* - Dar ADM
-┃ ⬇️ *.rebaixar [@membro]* - Tirar ADM
-┃ ⚠️ *.warn [@membro]* - Dar advertência
-┃ 📋 *.warnings [@membro]* - Ver advertências
-┃ 🚪 *.grupo [abrir/fechar]* - Trancar/Abrir grupo
-┃ 📢 *.marcartodos [motivo]* - Marcar todos
-┃ 🗑️ *.apagar* - Apagar mensagem do bot
-┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'menufig': {
-                    const txt = `
-╭━━━「 🎨 FIGURINHAS 」━━━╮
-┃
-┃ 🖼️ *.s* / *.fig* - Sticker de Foto/Vídeo
-┃ 🔤 *.ttp [texto]* - Sticker Texto Estático
-┃ ⚡ *.attp [texto]* - Sticker Texto Colorido
-┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'menudownload': {
-                    const txt = `
-╭━━━「 📥 DOWNLOADS 」━━━╮
-┃
-┃ 🖼️ Utilizar comandos gerais de mídia.
-┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'menuferramentas': {
-                    const txt = `
-╭━━━「 🛠️ FERRAMENTAS 」━━━╮
-┃
-┃ 🔳 *.qrcode [texto]*
-┃ 🌤️ *.clima [cidade]*
-┃ 🔗 *.encurtar [link]*
-┃ 🔑 *.senha [tamanho]*
-┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'menuosint': {
-                    const txt = `
-╭━━━「 🔎 FERRAMENTAS OSINT 」━━━╮
-┃
-┃ 🔎 *.search [termo]* - Google
-┃ 🌐 *.ip [ip]* - Localizar IP
-┃ 🏢 *.cnpj [cnpj]* - Dados da Empresa
-┃ 📍 *.cep [cep]* - Buscar Endereço
-┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'hidetag': {
-                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
-
-                    const groupMetadata = await sock.groupMetadata(from);
-                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
-                    const isAdmin = groupAdmins.includes(sender);
-
-                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas administradores do grupo podem usar este comando.' }, { quoted: msg });
-
-                    const participants = groupMetadata.participants.map(p => p.id);
-                    const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-                    const textHide = args.join(' ') || (quotedMsg?.conversation || quotedMsg?.extendedTextMessage?.text || '📢 Aviso da Administração!');
-
-                    await sock.sendMessage(from, { text: textHide, mentions: participants });
-                    break;
-                }
-
-                case 'ban':
-                case 'kick': {
-                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
-
-                    const groupMetadata = await sock.groupMetadata(from);
-                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
-                    const isAdmin = groupAdmins.includes(sender);
-                    const isBotAdmin = groupAdmins.includes(sock.user?.id.split(':')[0] + '@s.whatsapp.net');
-
-                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Você precisa ser Administrador para usar este comando.' }, { quoted: msg });
-                    if (!isBotAdmin) return await sock.sendMessage(from, { text: '❌ O Bot precisa ser Administrador do grupo!' }, { quoted: msg });
-
-                    const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant;
-                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || quotedSender;
-
-                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque ou responda à mensagem da pessoa que deseja remover.' }, { quoted: msg });
-
-                    try {
-                        await sock.groupParticipantsUpdate(from, [mentioned], 'remove');
-                        await sock.sendMessage(from, { text: `🚨 @${mentioned.split('@')[0]} foi removido com sucesso!`, mentions: [mentioned] }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Erro ao tentar remover o usuário.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'promover': {
-                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
-
-                    const groupMetadata = await sock.groupMetadata(from);
-                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
-                    const isAdmin = groupAdmins.includes(sender);
-                    const isBotAdmin = groupAdmins.includes(sock.user?.id.split(':')[0] + '@s.whatsapp.net');
-
-                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas ADMs podem promover membros.' }, { quoted: msg });
-                    if (!isBotAdmin) return await sock.sendMessage(from, { text: '❌ O Bot precisa ser ADM do grupo!' }, { quoted: msg });
-
-                    const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant;
-                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || quotedSender;
-
-                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque ou responda à pessoa que deseja promover.' }, { quoted: msg });
-
-                    await sock.groupParticipantsUpdate(from, [mentioned], 'promote');
-                    await sock.sendMessage(from, { text: `👑 @${mentioned.split('@')[0]} agora é um Administrador!`, mentions: [mentioned] }, { quoted: msg });
-                    break;
-                }
-
-                case 'rebaixar': {
-                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
-
-                    const groupMetadata = await sock.groupMetadata(from);
-                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
-                    const isAdmin = groupAdmins.includes(sender);
-                    const isBotAdmin = groupAdmins.includes(sock.user?.id.split(':')[0] + '@s.whatsapp.net');
-
-                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas ADMs podem rebaixar membros.' }, { quoted: msg });
-                    if (!isBotAdmin) return await sock.sendMessage(from, { text: '❌ O Bot precisa ser ADM do grupo!' }, { quoted: msg });
-
-                    const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant;
-                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || quotedSender;
-
-                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque ou responda à pessoa que deseja rebaixar.' }, { quoted: msg });
-
-                    await sock.groupParticipantsUpdate(from, [mentioned], 'demote');
-                    await sock.sendMessage(from, { text: `📉 @${mentioned.split('@')[0]} perdeu o cargo de Administrador.`, mentions: [mentioned] }, { quoted: msg });
-                    break;
-                }
-
-                case 'warn': {
-                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
-
-                    const groupMetadata = await sock.groupMetadata(from);
-                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
-                    const isAdmin = groupAdmins.includes(sender);
-                    const isBotAdmin = groupAdmins.includes(sock.user?.id.split(':')[0] + '@s.whatsapp.net');
-
-                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas ADMs podem dar advertências.' }, { quoted: msg });
-
-                    const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant;
-                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || quotedSender;
-
-                    if (!mentioned) return await sock.sendMessage(from, { text: '⚠️ Marque ou responda ao membro.' }, { quoted: msg });
-
-                    const targetUser = getUser(db, mentioned);
-                    targetUser.warnings += 1;
-                    
-                    if (targetUser.warnings >= 3) {
-                        targetUser.warnings = 0;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `🚨 @${mentioned.split('@')[0]} atingiu 3/3 advertências e foi removido!`, mentions: [mentioned] });
-                        if (isBotAdmin) {
-                            await sock.groupParticipantsUpdate(from, [mentioned], 'remove');
+                            break;
                         }
-                    } else {
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `⚠️ Advertência aplicada a @${mentioned.split('@')[0]}! (${targetUser.warnings}/3)`, mentions: [mentioned] });
-                    }
-                    break;
-                }
 
-                case 'warnings': {
-                    const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant;
-                    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || quotedSender || sender;
-                    const targetUser = getUser(db, mentioned);
-                    await sock.sendMessage(from, { text: `📋 O usuário @${mentioned.split('@')[0]} possui *${targetUser.warnings}/3* advertências.`, mentions: [mentioned] }, { quoted: msg });
-                    break;
-                }
+                        // =====================================
+                        // MENU DONO
+                        // =====================================
 
-                case 'grupo': {
-                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
-
-                    const groupMetadata = await sock.groupMetadata(from);
-                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
-                    const isAdmin = groupAdmins.includes(sender);
-                    const isBotAdmin = groupAdmins.includes(sock.user?.id.split(':')[0] + '@s.whatsapp.net');
-
-                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas ADMs podem alterar as configurações do grupo.' }, { quoted: msg });
-                    if (!isBotAdmin) return await sock.sendMessage(from, { text: '❌ O Bot precisa ser ADM do grupo!' }, { quoted: msg });
-
-                    const action = args[0]?.toLowerCase();
-                    if (action === 'fechar') {
-                        await sock.groupSettingUpdate(from, 'announcement');
-                        await sock.sendMessage(from, { text: '🔒 Grupo fechado! Apenas administradores podem enviar mensagens.' }, { quoted: msg });
-                    } else if (action === 'abrir') {
-                        await sock.groupSettingUpdate(from, 'not_announcement');
-                        await sock.sendMessage(from, { text: '🔓 Grupo aberto! Todos os membros podem enviar mensagens.' }, { quoted: msg });
-                    } else {
-                        await sock.sendMessage(from, { text: '⚠️ Use `.grupo abrir` ou `.grupo fechar`.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'marcartodos': {
-                    if (!isGroup) return await sock.sendMessage(from, { text: '⚠️ Este comando só funciona em grupos.' }, { quoted: msg });
-
-                    const groupMetadata = await sock.groupMetadata(from);
-                    const groupAdmins = groupMetadata.participants.filter(p => p.admin !== null).map(p => p.id);
-                    const isAdmin = groupAdmins.includes(sender);
-
-                    if (!isAdmin) return await sock.sendMessage(from, { text: '❌ Apenas ADMs podem marcar todos.' }, { quoted: msg });
-
-                    const participants = groupMetadata.participants.map(p => p.id);
-                    const motivo = args.join(' ') || 'Atenção todos!';
-                    await sock.sendMessage(from, { text: `📢 *CHAMADA GERAL*\n💬 *Motivo:* ${motivo}\n\n` + participants.map(p => `@${p.split('@')[0]}`).join(' '), mentions: participants });
-                    break;
-                }
-
-                case 'apagar': {
-                    const quotedMsgKey = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
-                    const participant = msg.message?.extendedTextMessage?.contextInfo?.participant;
-                    if (!quotedMsgKey) return await sock.sendMessage(from, { text: '⚠️ Responda à mensagem que deseja apagar.' }, { quoted: msg });
-                    await sock.sendMessage(from, { delete: { remoteJid: from, fromMe: false, id: quotedMsgKey, participant } });
-                    break;
-                }
-
-                case 'ia':
-                case 'chat':
-                case 'resuma':
-                case 'traduz':
-                case 'codigo': {
-                    const prompt = args.join(' ');
-                    if (!prompt) return await sock.sendMessage(from, { text: '⚠️ Digite algo para a Inteligência Artificial.' }, { quoted: msg });
-                    await sock.sendMessage(from, { text: '🧠 *Processando...*' }, { quoted: msg });
-                    try {
-                        const res = await axios.get(`https://api.simsimi.vn/v2/simsimi?text=${encodeURIComponent(prompt)}&lc=pt`);
-                        const reply = res.data.success || 'Não consegui processar o pedido.';
-                        await sock.sendMessage(from, { text: `🤖 *Pyda IA:* ${reply}` }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ O servidor de IA está indisponível no momento.' }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'addauto': {
-                    const content = args.join(' ').split('|');
-                    if (content.length < 2) return await sock.sendMessage(from, { text: '⚠️ Uso correto: `.addauto gatilho | resposta`' }, { quoted: msg });
-                    const gatilho = content[0].trim().toLowerCase();
-                    const resposta = content[1].trim();
-                    
-                    if (!db.autoresponder[from]) db.autoresponder[from] = {};
-                    db.autoresponder[from][gatilho] = resposta;
-                    saveDB(db);
-                    await sock.sendMessage(from, { text: `✅ Resposta criada para: *${gatilho}*` }, { quoted: msg });
-                    break;
-                }
-
-                case 'delauto': {
-                    const gatilho = args.join(' ').trim().toLowerCase();
-                    if (!gatilho || !db.autoresponder[from]?.[gatilho]) return await sock.sendMessage(from, { text: '⚠️ Gatilho não encontrado.' }, { quoted: msg });
-                    delete db.autoresponder[from][gatilho];
-                    saveDB(db);
-                    await sock.sendMessage(from, { text: `🗑️ Resposta removida!` }, { quoted: msg });
-                    break;
-                }
-
-                case 'listauto': {
-                    const list = db.autoresponder[from];
-                    if (!list || Object.keys(list).length === 0) return await sock.sendMessage(from, { text: 'ℹ️ Nenhuma resposta automática cadastrada neste chat.' }, { quoted: msg });
-                    let txt = `📋 *RESPOSTAS AUTOMÁTICAS:*\n─────────────────────\n`;
-                    for (let g in list) txt += `• *${g}* ➔ ${list[g]}\n`;
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'saldo': {
-                    const txt = `
-💳 *SEU SALDO*
-─────────────────────
-👤 *Nome:* ${user.nome}
-💵 *Carteira:* R$ ${user.carteira}
-🏦 *Banco:* R$ ${user.banco}
-❤️ *Vida (HP):* ${user.hp}/100
-⭐ *Nível:* ${user.nivel} (${user.xp} XP)
-─────────────────────`.trim();
-                    await sock.sendMessage(from, { text: txt }, { quoted: msg });
-                    break;
-                }
-
-                case 'trabalhar': {
-                    const cooldown = 3600000;
-                    const now = Date.now();
-                    if (user.workCooldown && (now - user.workCooldown < cooldown)) {
-                        const remaining = Math.ceil((cooldown - (now - user.workCooldown)) / 60000);
-                        return await sock.sendMessage(from, { text: `⏳ Você está cansado. Espere ${remaining} minutos para trabalhar de novo.` }, { quoted: msg });
-                    }
-                    const ganho = Math.floor(Math.random() * 250) + 50;
-                    user.carteira += ganho;
-                    user.workCooldown = now;
-                    saveDB(db);
-                    await sock.sendMessage(from, { text: `🛠️ Você trabalhou e ganhou *R$ ${ganho}*!` }, { quoted: msg });
-                    break;
-                }
-
-                case 'depositar': {
-                    const val = parseInt(args[0]);
-                    if (isNaN(val) || val <= 0) return await sock.sendMessage(from, { text: '⚠️ Digite um valor válido. Ex: `.depositar 100`' }, { quoted: msg });
-                    if (user.carteira < val) return await sock.sendMessage(from, { text: '❌ Saldo insuficiente em carteira.' }, { quoted: msg });
-                    user.carteira -= val;
-                    user.banco += val;
-                    saveDB(db);
-                    await sock.sendMessage(from, { text: `🏦 R$ ${val} depositados com sucesso no banco!` }, { quoted: msg });
-                    break;
-                }
-
-                case 'sacar': {
-                    const val = parseInt(args[0]);
-                    if (isNaN(val) || val <= 0) return await sock.sendMessage(from, { text: '⚠️ Digite um valor válido. Ex: `.sacar 100`' }, { quoted: msg });
-                    if (user.banco < val) return await sock.sendMessage(from, { text: '❌ Saldo insuficiente no banco.' }, { quoted: msg });
-                    user.banco -= val;
-                    user.carteira += val;
-                    saveDB(db);
-                    await sock.sendMessage(from, { text: `🏧 R$ ${val} sacados do banco!` }, { quoted: msg });
-                    break;
-                }
-
-                case 'dragao': {
-                    if (user.hp <= 20) return await sock.sendMessage(from, { text: '❌ Sua vida está muito baixa! Use `.curar` primeiro.' }, { quoted: msg });
-                    const resultado = Math.random() > 0.4;
-                    user.jogos += 1;
-                    if (resultado) {
-                        const premio = Math.floor(Math.random() * 400) + 200;
-                        user.carteira += premio;
-                        user.vitorias += 1;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `⚔️ 🐉 *VITÓRIA!* Você derrotou o Dragão e ganhou *R$ ${premio}*!` }, { quoted: msg });
-                    } else {
-                        const dano = Math.floor(Math.random() * 30) + 20;
-                        user.hp -= dano;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `⚔️ 💥 *DERROTA!* O Dragão te atacou e você perdeu ${dano} de HP. (HP Atual: ${user.hp})` }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'curar': {
-                    if (user.carteira < 50) return await sock.sendMessage(from, { text: '❌ Você precisa de R$ 50 na carteira para se curar.' }, { quoted: msg });
-                    user.carteira -= 50;
-                    user.hp = 100;
-                    saveDB(db);
-                    await sock.sendMessage(from, { text: `💊 Você usou uma poção de cura e seu HP voltou para 100!` }, { quoted: msg });
-                    break;
-                }
-
-                case 'daily': {
-                    const now = Date.now();
-                    const cooldown = 86400000;
-                    if (now - user.dailyCooldown < cooldown) {
-                        const remaining = Math.ceil((cooldown - (now - user.dailyCooldown)) / 3600000);
-                        return await sock.sendMessage(from, { text: `⏳ Bônus já resgatado! Volte em ${remaining} horas.` }, { quoted: msg });
-                    }
-                    user.carteira += 500;
-                    user.dailyCooldown = now;
-                    saveDB(db);
-                    await sock.sendMessage(from, { text: `🎁 *Prêmio Diário!* Você ganhou R$ 500 moedas.` }, { quoted: msg });
-                    break;
-                }
-
-                case 'dado': {
-                    const num = Math.floor(Math.random() * 6) + 1;
-                    await sock.sendMessage(from, { text: `🎲 Você jogou o dado e tirou: *${num}*` }, { quoted: msg });
-                    break;
-                }
-
-                case 'caraoucoroa': {
-                    const escolha = args[0]?.toLowerCase();
-                    const aposta = parseInt(args[1]);
-                    if (!['cara', 'coroa'].includes(escolha) || isNaN(aposta) || aposta <= 0) {
-                        return await sock.sendMessage(from, { text: '⚠️ Uso correto: `.caraoucoroa [cara/coroa] [aposta]`' }, { quoted: msg });
-                    }
-                    if (user.carteira < aposta) return await sock.sendMessage(from, { text: '❌ Saldo insuficiente.' }, { quoted: msg });
-
-                    const resultado = Math.random() > 0.5 ? 'cara' : 'coroa';
-                    if (escolha === resultado) {
-                        user.carteira += aposta;
-                        user.vitorias += 1;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `🪙 Deu *${resultado.toUpperCase()}*! Você venceu e ganhou R$ ${aposta}!` }, { quoted: msg });
-                    } else {
-                        user.carteira -= aposta;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `🪙 Deu *${resultado.toUpperCase()}*! Você perdeu R$ ${aposta}.` }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'tigrinho':
-                case 'foguete': {
-                    const aposta = parseInt(args[0]);
-                    if (isNaN(aposta) || aposta <= 0) return await sock.sendMessage(from, { text: '⚠️ Digite o valor da aposta. Ex: `.tigrinho 50`' }, { quoted: msg });
-                    if (user.carteira < aposta) return await sock.sendMessage(from, { text: '❌ Saldo insuficiente na carteira.' }, { quoted: msg });
-
-                    const venceu = Math.random() > 0.6;
-                    if (venceu) {
-                        const premio = aposta * 2;
-                        user.carteira += premio;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `🎰 🚀 *LUCKY WIN!* Você apostou R$ ${aposta} e multiplicou para *R$ ${premio}*!` }, { quoted: msg });
-                    } else {
-                        user.carteira -= aposta;
-                        saveDB(db);
-                        await sock.sendMessage(from, { text: `💥 *CRASH!* Você perdeu a aposta de R$ ${aposta}.` }, { quoted: msg });
-                    }
-                    break;
-                }
-
-                case 'perfil': {
-                    const status = `
-╭━━━「 👤 PERFIL DO USUÁRIO 」━━━╮
+                        case 'menudono': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`╭━━━「 👑 MENU DONO 」━━━╮
 ┃
-┃ 📛 *Nome:* ${user.nome}
-┃ 💰 *Carteira:* R$ ${user.carteira}
-┃ 🏦 *Banco:* R$ ${user.banco}
-┃ ❤️ *HP:* ${user.hp}/100
-┃ ⭐ *XP Total:* ${user.xp}
-┃ 🏆 *Nível:* ${user.nivel}
-┃ 🎮 *Partidas:* ${user.jogos}
-┃ 🥇 *Vitórias:* ${user.vitorias}
-┃ ⚠️ *Advertências:* ${user.warnings}/3
+┃ 📢 .bc [texto]
+┃ 👤 .dono
+┃ ⚙️ .restart
 ┃
-╰━━━━━━━━━━━━━━━━━━━━╯`.trim();
-                    await sock.sendMessage(from, { text: status }, { quoted: msg });
-                    break;
-                }
+╰━━━━━━━━━━━━━━━━━━━━╯`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
 
-                case 'rank': {
-                    const allUsers = Object.keys(db.users)
-                        .map(k => ({ id: k, ...db.users[k] }))
-                        .sort((a, b) => b.xp - a.xp)
-                        .slice(0, 10);
+                            break;
+                        }
 
-                    let rankMsg = `🏆 *RANKING DO GRUPO*\n─────────────────────\n`;
-                    allUsers.forEach((u, idx) => {
-                        const pos = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `${idx + 1}.`;
-                        rankMsg += `${pos} *${u.nome}* — Lv. ${u.nivel} (${u.xp} XP)\n`;
-                    });
-                    await sock.sendMessage(from, { text: rankMsg.trim() }, { quoted: msg });
-                    break;
-                }
+                        // =====================================
+                        // MENU AUTO
+                        // =====================================
 
-                case 's':
-                case 'sticker':
-                case 'fig': {
-                    const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-                    const isMedia = msg.message?.imageMessage || msg.message?.videoMessage;
-                    const isQuotedMedia = quotedMsg?.imageMessage || quotedMsg?.videoMessage;
-                    if (!isMedia && !isQuotedMedia) return await sock.sendMessage(from, { text: '⚠️ Envie ou responda a uma foto ou vídeo.' }, { quoted: msg });
+                        case 'menuauto': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`╭━━━「 🤖 AUTOMAÇÃO 」━━━╮
+┃
+┃ 💬 .addauto gatilho | resposta
+┃ ❌ .delauto gatilho
+┃ 📋 .listauto
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
 
-                    const mediaMessage = isMedia ? (msg.message.imageMessage || msg.message.videoMessage) : (quotedMsg.imageMessage || quotedMsg.videoMessage);
-                    const isVideo = !!(msg.message?.videoMessage || quotedMsg?.videoMessage);
-                    
-                    await sock.sendMessage(from, { text: '⏳ Gerando sticker...' }, { quoted: msg });
-                    try {
-                        const stream = await downloadContentFromMessage(mediaMessage, isVideo ? 'video' : 'image');
-                        let buffer = Buffer.alloc(0);
-                        for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+                            break;
+                        }
 
-                        const tempInput = path.join(__dirname, `temp_${Date.now()}.${isVideo ? 'mp4' : 'jpg'}`);
-                        const tempOutput = path.join(__dirname, `temp_${Date.now()}.webp`);
-                        fs.writeFileSync(tempInput, buffer);
+                        // =====================================
+                        // MENU RPG
+                        // =====================================
 
-                        ffmpeg(tempInput)
-                            .outputOptions(['-vcodec libwebp', '-vf scale=\'min(320,iw)\':\'min(320,ih)\':force_original_aspect_ratio=decrease,fps=15,pad=320:320:(320-iw)/2:(320-ih)/2:color=0x00000000'])
-                            .toFormat('webp')
-                            .save(tempOutput)
-                            .on('end', async () => {
-                                await sock.sendMessage(from, { sticker: fs.readFileSync(tempOutput) }, { quoted: msg });
-                                if (fs.existsSync(tempInput)) fs.unlinkSync(tempInput);
-                                if (fs.existsSync(tempOutput)) fs.unlinkSync(tempOutput);
-                            })
-                            .on('error', () => {
-                                sock.sendMessage(from, { text: '❌ Erro ao converter arquivo de mídia.' }, { quoted: msg });
-                            });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Falha ao baixar mídia.' }, { quoted: msg });
+                        case 'menurpg': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`╭━━━「 ⚔️ RPG & ECONOMIA 」━━━╮
+┃
+┃ 💼 .trabalhar
+┃ 💳 .saldo
+┃ 👤 .perfil
+┃ 🏦 .depositar [valor]
+┃ 🏧 .sacar [valor]
+┃ 💊 .curar
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // MENU JOGOS
+                        // =====================================
+
+                        case 'menujogos': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`╭━━━「 🎮 JOGOS 」━━━╮
+┃
+┃ 🎰 .tigrinho [aposta]
+┃ 🪙 .caraoucoroa [cara/coroa] [aposta]
+┃ 🎲 .dado
+┃ 🎁 .daily
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // MENU MEMBRO
+                        // =====================================
+
+                        case 'menumembro': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`╭━━━「 🧰 UTILITÁRIOS 」━━━╮
+┃
+┃ 🔍 .ping
+┃ 👁️ .revelar
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // MENU IA
+                        // =====================================
+
+                        case 'menuia': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`╭━━━「 🧠 INTELIGÊNCIA ARTIFICIAL 」━━━╮
+┃
+┃ 🤖 .ia [pergunta]
+┃
+╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // MENU ADM
+                        // =====================================
+
+                        case 'menuadm': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`╭━━━「 🛡️ MENU ADM 」━━━╮
+┃
+┃ 📢 .hidetag [texto]
+┃ 🛑 .ban / .kick
+┃ 👑 .promover
+┃ ⬇️ .rebaixar
+┃ ⚠️ .warn
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // MENU OSINT
+                        // =====================================
+
+                        case 'menuosint': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`╭━━━「 🔎 FERRAMENTAS 」━━━╮
+┃
+┃ 🔎 .search [termo]
+┃ 🌐 .ip [ip]
+┃ 🏢 .cnpj [cnpj]
+┃ 📍 .cep [cep]
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // MENU FERRAMENTAS
+                        // =====================================
+
+                        case 'menuferramentas': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`╭━━━「 🛠️ FERRAMENTAS 」━━━╮
+┃
+┃ 🔑 .senha [tamanho]
+┃ 🔗 .encurtar [link]
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // MENU FIGURINHAS
+                        // =====================================
+
+                        case 'menufig': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`╭━━━「 🎨 FIGURINHAS 」━━━╮
+┃
+┃ 🖼️ Responda uma imagem/vídeo
+┃
+┃ .s
+┃ .fig
+┃ .sticker
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // IA
+                        // =====================================
+
+                        case 'ia':
+                        case 'gpt': {
+                            const prompt =
+                                args.join(' ').trim();
+
+                            if (!prompt) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '⚠️ Digite sua pergunta.\n\nExemplo:\n.ia explique o que é JavaScript'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '🤖 *Processando...*'
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            try {
+                                const response =
+                                    await axios.get(
+                                        'https://api.simsimi.vn/v1/simtalk',
+                                        {
+                                            params: {
+                                                text: prompt,
+                                                lc: 'pt'
+                                            },
+                                            timeout: 15000
+                                        }
+                                    );
+
+                                const reply =
+                                    response.data?.message ||
+                                    'Não consegui obter uma resposta.';
+
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            `🧠 *Pyda IA:*\n\n${reply}`
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+                            } catch (error) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ O serviço de IA está indisponível no momento.'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+                            }
+
+                            break;
+                        }
+
+                        // =====================================
+                        // PING
+                        // =====================================
+
+                        case 'ping': {
+                            const start =
+                                Date.now();
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '🏓 *Pong!*'
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            console.log(
+                                `🏓 Ping: ${Date.now() - start}ms`
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // DONO
+                        // =====================================
+
+                        case 'dono': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`👤 *Desenvolvedor:* Odin
+🤖 *Bot:* Pyda
+📱 *Status:* Online`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // FIGURINHA
+                        // =====================================
+
+                        case 's':
+                        case 'fig':
+                        case 'sticker': {
+                            let target =
+                                msg.message;
+
+                            const quoted =
+                                getQuotedMessage(msg);
+
+                            if (quoted) {
+                                target = quoted;
+                            }
+
+                            const imageMsg =
+                                target?.imageMessage;
+
+                            const videoMsg =
+                                target?.videoMessage;
+
+                            if (
+                                !imageMsg &&
+                                !videoMsg
+                            ) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '⚠️ Envie ou responda uma imagem ou vídeo com *.s*.'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            try {
+                                const mediaType =
+                                    imageMsg
+                                        ? 'image'
+                                        : 'video';
+
+                                const buffer =
+                                    await downloadMedia(
+                                        imageMsg ||
+                                        videoMsg,
+                                        mediaType
+                                    );
+
+                                /*
+                                 * O Baileys aceita WebP como sticker.
+                                 * Para vídeos/GIFs, o arquivo precisa estar
+                                 * previamente convertido para WebP.
+                                 */
+
+                                if (mediaType === 'image') {
+                                    await sock.sendMessage(
+                                        from,
+                                        {
+                                            sticker: buffer
+                                        },
+                                        {
+                                            quoted: msg
+                                        }
+                                    );
+                                } else {
+                                    await sock.sendMessage(
+                                        from,
+                                        {
+                                            sticker: buffer
+                                        },
+                                        {
+                                            quoted: msg
+                                        }
+                                    );
+                                }
+                            } catch (error) {
+                                console.error(
+                                    'Erro sticker:',
+                                    error.message
+                                );
+
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ Não foi possível transformar essa mídia em figurinha.'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+                            }
+
+                            break;
+                        }
+
+                        // =====================================
+                        // AUTORESPONDER
+                        // =====================================
+
+                        case 'addauto': {
+                            const fullText =
+                                args.join(' ');
+
+                            const separator =
+                                fullText.indexOf('|');
+
+                            if (
+                                separator === -1
+                            ) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '⚠️ Use:\n.addauto gatilho | resposta'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            const trigger =
+                                fullText
+                                    .slice(0, separator)
+                                    .trim()
+                                    .toLowerCase();
+
+                            const response =
+                                fullText
+                                    .slice(separator + 1)
+                                    .trim();
+
+                            if (
+                                !trigger ||
+                                !response
+                            ) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '⚠️ O gatilho e a resposta não podem ficar vazios.'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            if (
+                                !db.autoresponder[from]
+                            ) {
+                                db.autoresponder[from] = {};
+                            }
+
+                            db.autoresponder[from][trigger] =
+                                response;
+
+                            saveDB(db);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `✅ Autoresposta adicionada!\n\n💬 Gatilho: *${trigger}*`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // DEL AUTO
+                        // =====================================
+
+                        case 'delauto': {
+                            const trigger =
+                                args.join(' ')
+                                    .trim()
+                                    .toLowerCase();
+
+                            if (
+                                !trigger ||
+                                !db.autoresponder[from] ||
+                                !db.autoresponder[from][trigger]
+                            ) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '⚠️ Gatilho não encontrado.'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            delete db.autoresponder[from][trigger];
+
+                            saveDB(db);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `✅ Autoresposta *${trigger}* removida.`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // LIST AUTO
+                        // =====================================
+
+                        case 'listauto': {
+                            const auto =
+                                db.autoresponder[from] ||
+                                {};
+
+                            const keys =
+                                Object.keys(auto);
+
+                            if (!keys.length) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '📋 Nenhuma autoresposta cadastrada neste chat.'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            let text =
+                                '📋 *AUTORESPOSTAS*\n\n';
+
+                            keys.forEach(
+                                (key, index) => {
+                                    text +=
+                                        `${index + 1}. *${key}* ➜ ${auto[key]}\n`;
+                                }
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // PERFIL
+                        // =====================================
+
+                        case 'perfil':
+                        case 'saldo': {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+`👤 *PERFIL*
+
+╭────────────────────
+│ 👤 Nome: ${user.nome}
+│ 🪙 Carteira: R$ ${formatMoney(user.carteira)}
+│ 🏦 Banco: R$ ${formatMoney(user.banco)}
+│ ⭐ Nível: ${user.nivel}
+│ ✨ XP: ${user.xp}
+│ ❤️ HP: ${user.hp}/100
+│ 🎮 Jogos: ${user.jogos}
+│ 🏆 Vitórias: ${user.vitorias}
+│ ⚠️ Warns: ${user.warnings}/3
+╰────────────────────`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // TRABALHAR
+                        // =====================================
+
+                        case 'trabalhar': {
+                            const now =
+                                Date.now();
+
+                            const cooldown =
+                                5 * 60 * 1000;
+
+                            if (
+                                now -
+                                user.workCooldown <
+                                cooldown
+                            ) {
+                                const remaining =
+                                    cooldown -
+                                    (
+                                        now -
+                                        user.workCooldown
+                                    );
+
+                                const minutes =
+                                    Math.ceil(
+                                        remaining /
+                                        60000
+                                    );
+
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            `⏳ Aguarde aproximadamente *${minutes} minuto(s)*.`
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            const ganho =
+                                randomInt(
+                                    50,
+                                    200
+                                );
+
+                            user.carteira += ganho;
+
+                            user.workCooldown =
+                                now;
+
+                            saveDB(db);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `💼 Você trabalhou e recebeu *R$ ${formatMoney(ganho)}*!`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // DAILY
+                        // =====================================
+
+                        case 'daily': {
+                            const now =
+                                Date.now();
+
+                            const cooldown =
+                                24 * 60 * 60 * 1000;
+
+                            if (
+                                now -
+                                user.dailyCooldown <
+                                cooldown
+                            ) {
+                                const remaining =
+                                    cooldown -
+                                    (
+                                        now -
+                                        user.dailyCooldown
+                                    );
+
+                                const hours =
+                                    Math.ceil(
+                                        remaining /
+                                        3600000
+                                    );
+
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            `⏳ Você já recebeu seu bônus. Tente novamente em aproximadamente *${hours} hora(s)*.`
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            const bonus =
+                                500;
+
+                            user.carteira +=
+                                bonus;
+
+                            user.dailyCooldown =
+                                now;
+
+                            saveDB(db);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `🎁 Você recebeu seu bônus diário de *R$ ${formatMoney(bonus)}*!`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // DEPOSITAR
+                        // =====================================
+
+                        case 'depositar': {
+                            const value =
+                                Number(
+                                    args[0]
+                                );
+
+                            if (
+                                !Number.isInteger(value) ||
+                                value <= 0
+                            ) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '⚠️ Informe um valor inteiro positivo.'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            if (
+                                user.carteira <
+                                value
+                            ) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ Saldo insuficiente na carteira.'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            user.carteira -=
+                                value;
+
+                            user.banco +=
+                                value;
+
+                            saveDB(db);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `🏦 Você depositou *R$ ${formatMoney(value)}*.`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // SACAR
+                        // =====================================
+
+                        case 'sacar': {
+                            const value =
+                                Number(
+                                    args[0]
+                                );
+
+                            if (
+                                !Number.isInteger(value) ||
+                                value <= 0
+                            ) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '⚠️ Informe um valor inteiro positivo.'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            if (
+                                user.banco <
+                                value
+                            ) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ Saldo insuficiente no banco.'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            user.banco -=
+                                value;
+
+                            user.carteira +=
+                                value;
+
+                            saveDB(db);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `🏧 Você sacou *R$ ${formatMoney(value)}*.`
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+
+                        // =====================================
+                        // CURAR
+                        // =====================================
+
+                        case 'curar': {
+                            const price =
+                                50;
+
+                            if (
+                                user.hp >=
+                                100
+                            ) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❤️ Seu HP já está cheio.'
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            if (
+                                user.carteira <
+                                price
+                            ) {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            `❌ Você precisa de R$ ${price} para se curar.`
+                                    },
+                                    {
+                                        quoted: msg
+                                    }
+                                );
+
+                                break;
+                            }
+
+                            user.carteira -=
+                                price;
+
+                            user.hp =
+                                100;
+
+                            saveDB(db);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '💊 Seu HP foi restaurado para *100/100*!'
+                                },
+                                {
+                                    quoted: msg
+                                }
+                            );
+
+                            break;
+                        }
+                    // =========================================================
+                    // IA
+                    // =========================================================
+
+                    case 'ia':
+                    case 'gpt': {
+                        const prompt = args.join(' ').trim();
+
+                        if (!prompt) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text: '⚠️ Envie uma pergunta.\n\nExemplo:\n.ia explique o que é JavaScript'
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        await sock.sendMessage(
+                            from,
+                            { text: '🤖 *Pensando...*' },
+                            { quoted: msg }
+                        );
+
+                        try {
+                            const response = await axios.get(
+                                'https://api.simsimi.vn/v1/simtalk',
+                                {
+                                    params: {
+                                        text: prompt,
+                                        lc: 'pt'
+                                    },
+                                    timeout: 15000
+                                }
+                            );
+
+                            const reply =
+                                response.data?.message ||
+                                'Não consegui obter uma resposta agora.';
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text: `🧠 *Pyda IA*\n\n${reply}`
+                                },
+                                { quoted: msg }
+                            );
+
+                        } catch (error) {
+                            console.error('Erro IA:', error.message);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text: '❌ O serviço de IA está indisponível no momento.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
                     }
-                    break;
-                }
 
-                case 'ttp':
-                case 'attp': {
-                    const text = args.join(' ');
-                    if (!text) return await sock.sendMessage(from, { text: '⚠️ Digite o texto.' }, { quoted: msg });
-                    try {
-                        const imgUrl = `https://dummyimage.com/512x512/000000/fff.png&text=${encodeURIComponent(text)}`;
-                        const res = await axios.get(imgUrl, { responseType: 'arraybuffer' });
-                        const tempInput = path.join(__dirname, `temp_${Date.now()}.png`);
-                        const tempOutput = path.join(__dirname, `temp_${Date.now()}.webp`);
-                        fs.writeFileSync(tempInput, res.data);
 
-                        ffmpeg(tempInput)
-                            .outputOptions(['-vcodec libwebp', '-vf scale=320:320'])
-                            .toFormat('webp')
-                            .save(tempOutput)
-                            .on('end', async () => {
-                                await sock.sendMessage(from, { sticker: fs.readFileSync(tempOutput) }, { quoted: msg });
-                                if (fs.existsSync(tempInput)) fs.unlinkSync(tempInput);
-                                if (fs.existsSync(tempOutput)) fs.unlinkSync(tempOutput);
-                            });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Erro ao gerar texto em sticker.' }, { quoted: msg });
+                    // =========================================================
+                    // FIGURINHA
+                    // =========================================================
+
+                    case 's':
+                    case 'fig':
+                    case 'sticker': {
+
+                        let targetMessage = msg.message;
+
+                        const contextInfo =
+                            msg.message?.extendedTextMessage?.contextInfo;
+
+                        if (contextInfo?.quotedMessage) {
+                            targetMessage = contextInfo.quotedMessage;
+                        }
+
+                        // Suporte a visualização única
+                        if (targetMessage?.viewOnceMessage?.message) {
+                            targetMessage =
+                                targetMessage.viewOnceMessage.message;
+                        }
+
+                        if (targetMessage?.viewOnceMessageV2?.message) {
+                            targetMessage =
+                                targetMessage.viewOnceMessageV2.message;
+                        }
+
+                        if (targetMessage?.viewOnceMessageV2Extension?.message) {
+                            targetMessage =
+                                targetMessage.viewOnceMessageV2Extension.message;
+                        }
+
+                        const imageMessage =
+                            targetMessage?.imageMessage;
+
+                        const videoMessage =
+                            targetMessage?.videoMessage;
+
+                        if (!imageMessage && !videoMessage) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Envie ou responda a uma imagem ou vídeo usando:\n\n' +
+                                        '*.s*'
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        try {
+                            const mediaType = imageMessage
+                                ? 'image'
+                                : 'video';
+
+                            const mediaMessage =
+                                imageMessage || videoMessage;
+
+                            const stream =
+                                await downloadContentFromMessage(
+                                    mediaMessage,
+                                    mediaType
+                                );
+
+                            const chunks = [];
+
+                            for await (const chunk of stream) {
+                                chunks.push(chunk);
+                            }
+
+                            const buffer = Buffer.concat(chunks);
+
+                            if (!buffer.length) {
+                                throw new Error('Mídia vazia.');
+                            }
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    sticker: buffer
+                                },
+                                { quoted: msg }
+                            );
+
+                        } catch (error) {
+                            console.error(
+                                'Erro ao criar figurinha:',
+                                error.message
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Não foi possível criar a figurinha.\n\n' +
+                                        'Para vídeos, verifique se o FFmpeg está instalado.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
                     }
-                    break;
-                }
 
-                case 'qrcode': {
-                    const text = args.join(' ');
-                    if (!text) return await sock.sendMessage(from, { text: '⚠️ Digite um texto/link.' }, { quoted: msg });
-                    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(text)}`;
-                    await sock.sendMessage(from, { image: { url: qrUrl }, caption: `✅ QR Code Gerado!` }, { quoted: msg });
-                    break;
-                }
 
-                case 'clima': {
-                    const cidade = args.join(' ');
-                    if (!cidade) return await sock.sendMessage(from, { text: '⚠️ Digite a cidade.' }, { quoted: msg });
-                    try {
-                        const res = await axios.get(`https://wttr.in/${encodeURIComponent(cidade)}?format=3`);
-                        await sock.sendMessage(from, { text: `🌤️ *Clima:* ${res.data}` }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Erro ao obter dados do clima.' }, { quoted: msg });
+                    // =========================================================
+                    // DONO
+                    // =========================================================
+
+                    case 'dono': {
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    '👤 *DESENVOLVEDOR*\n' +
+                                    '─────────────────────\n' +
+                                    '👑 Odin\n' +
+                                    '✈️ Telegram: t.me/Odinadm'
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
                     }
-                    break;
-                }
 
-                case 'search': {
-                    const query = args.join(' ');
-                    if (!query) return await sock.sendMessage(from, { text: '⚠️ Digite o termo de pesquisa.' }, { quoted: msg });
-                    try {
-                        const url = `https://serpapi.com/search.json?q=${encodeURIComponent(query)}&engine=google&hl=pt-br&gl=br&api_key=${SERPAPI_KEY}`;
-                        const res = await axios.get(url);
-                        const results = res.data.organic_results;
-                        if (!results || results.length === 0) return await sock.sendMessage(from, { text: '❌ Nenhum resultado encontrado.' }, { quoted: msg });
 
-                        let resposta = `🔎 *RESULTADOS DA PESQUISA:*\n\n`;
-                        results.slice(0, 4).forEach((item, index) => {
-                            resposta += `*${index+1}. ${item.title}*\n🔗 ${item.link}\n\n`;
+                    // =========================================================
+                    // PING
+                    // =========================================================
+
+                    case 'ping': {
+
+                        const inicio = Date.now();
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text: '🏓 *Pong!*'
+                            },
+                            { quoted: msg }
+                        );
+
+                        const tempo = Date.now() - inicio;
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text: `⚡ Latência: *${tempo}ms*`
+                            }
+                        );
+
+                        break;
+                    }
+
+
+                    // =========================================================
+                    // AUTORESPONDER
+                    // =========================================================
+
+                    case 'addauto': {
+
+                        const fullText = args.join(' ');
+                        const parts = fullText.split('|');
+
+                        if (parts.length < 2) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Formato correto:\n\n' +
+                                        '.addauto gatilho | resposta'
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        const trigger =
+                            parts.shift().trim().toLowerCase();
+
+                        const response =
+                            parts.join('|').trim();
+
+                        if (!trigger || !response) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text: '⚠️ Gatilho e resposta são obrigatórios.'
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        if (!db.autoresponder[from]) {
+                            db.autoresponder[from] = {};
+                        }
+
+                        db.autoresponder[from][trigger] = response;
+
+                        saveDB(db);
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    `✅ *Autoresposta adicionada!*\n\n` +
+                                    `💬 Gatilho: *${trigger}*\n` +
+                                    `🤖 Resposta: ${response}`
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+
+
+                    case 'delauto': {
+
+                        const trigger =
+                            args.join(' ').trim().toLowerCase();
+
+                        if (!trigger) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Informe o gatilho.\n\n' +
+                                        'Exemplo: .delauto oi'
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        if (!db.autoresponder[from]?.[trigger]) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `❌ Não existe autoresposta para *${trigger}*.`
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        delete db.autoresponder[from][trigger];
+
+                        saveDB(db);
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    `✅ Autoresposta *${trigger}* removida.`
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+
+
+                    case 'listauto': {
+
+                        const chatAuto =
+                            db.autoresponder[from] || {};
+
+                        const triggers =
+                            Object.keys(chatAuto);
+
+                        if (!triggers.length) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '📋 Nenhuma autoresposta cadastrada neste chat.'
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        let text =
+                            '📋 *AUTORESPONDER*\n' +
+                            '─────────────────────\n\n';
+
+                        triggers.forEach((trigger, index) => {
+                            text +=
+                                `${index + 1}. *${trigger}*\n` +
+                                `↳ ${chatAuto[trigger]}\n\n`;
                         });
-                        await sock.sendMessage(from, { text: resposta }, { quoted: msg });
-                    } catch {
-                        await sock.sendMessage(from, { text: '❌ Erro ao pesquisar no Google.' }, { quoted: msg });
+
+                        await sock.sendMessage(
+                            from,
+                            { text },
+                            { quoted: msg }
+                        );
+
+                        break;
                     }
-                    break;
-                }
 
-                case 'ip': {
-                    const target = args[0];
-                    if (!target) return await sock.sendMessage(from, { text: '⚠️ Digite o IP.' }, { quoted: msg });
-                    try {
-                        const res = await axios.get(`http://ip-api.com/json/${target}`);
-                        const info = `🌐 *IP:* ${res.data.query}\n🏳️ *País:* ${res.data.country}\n🏙️ *Cidade:* ${res.data.city}\n🏢 *ISP:* ${res.data.isp}`;
-                        await sock.sendMessage(from, { text: info }, { quoted: msg });
-                    } catch { await sock.sendMessage(from, { text: '❌ Erro ao consultar IP.' }, { quoted: msg }); }
-                    break;
-                }
 
-                case 'ping': {
-                    await sock.sendMessage(from, { text: '🏓 *Pong!* Pyda Bot v4.0 Ativo e Operacional!' }, { quoted: msg });
-                    break;
-                }
+                    // =========================================================
+                    // PERFIL / ECONOMIA
+                    // =========================================================
 
-                default: {
-                    await sock.sendMessage(from, { 
-                        text: `⚠️ *Comando incorreto ou inexistente!*\n\nO comando *${prefix}${command}* não foi encontrado. Digite *.menu* para ver a lista de comandos disponíveis.` 
-                    }, { quoted: msg });
-                    break;
+                    case 'perfil':
+                    case 'saldo': {
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    `👤 *PERFIL DE ${user.nome}*\n` +
+                                    `─────────────────────\n` +
+                                    `🪙 Carteira: *R$ ${user.carteira}*\n` +
+                                    `🏦 Banco: *R$ ${user.banco}*\n` +
+                                    `⭐ Nível: *${user.nivel}*\n` +
+                                    `✨ XP: *${user.xp}*\n` +
+                                    `❤️ HP: *${user.hp}/100*\n` +
+                                    `⚠️ Warns: *${user.warnings}/3*`
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+
+
+                    case 'trabalhar': {
+
+                        const agora = Date.now();
+                        const cooldown = 5 * 60 * 1000;
+
+                        if (
+                            agora - (user.workCooldown || 0) <
+                            cooldown
+                        ) {
+                            const restante =
+                                cooldown -
+                                (agora - (user.workCooldown || 0));
+
+                            const minutos =
+                                Math.ceil(restante / 60000);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `⏳ Você precisa esperar aproximadamente *${minutos} minuto(s)*.`
+                                },
+                                { quoted: msg }
+                            );
+
+                            break;
+                        }
+
+                        const ganho =
+                            Math.floor(Math.random() * 151) + 50;
+
+                        user.carteira += ganho;
+                        user.workCooldown = agora;
+
+                        const subiuNivel =
+                            addXP(user, 15);
+
+                        saveDB(db);
+
+                        let resposta =
+                            `💼 *TRABALHO CONCLUÍDO!*\n\n` +
+                            `💰 Você recebeu: *R$ ${ganho}*`;
+
+                        if (subiuNivel) {
+                            resposta +=
+                                `\n\n🎉 *LEVEL UP!*\n` +
+                                `⭐ Novo nível: *${user.nivel}*`;
+                        }
+
+                        await sock.sendMessage(
+                            from,
+                            { text: resposta },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+
+
+                    case 'daily': {
+
+                        const agora = Date.now();
+                        const cooldown = 24 * 60 * 60 * 1000;
+
+                        if (
+                            agora - (user.dailyCooldown || 0) <
+                            cooldown
+                        ) {
+                            const restante =
+                                cooldown -
+                                (agora - (user.dailyCooldown || 0));
+
+                            const horas =
+                                Math.ceil(restante / 3600000);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `⏳ Você já pegou seu Daily.\n\n` +
+                                        `Tente novamente em aproximadamente *${horas}h*.`
+                                },
+                                { quoted: msg }
+                            );
+
+                            break;
+                        }
+
+                        user.carteira += 500;
+                        user.dailyCooldown = agora;
+
+                        addXP(user, 10);
+
+                        saveDB(db);
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    '🎁 *DAILY RESGATADO!*\n\n' +
+                                    '💰 +R$ 500\n' +
+                                    '✨ +10 XP'
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+
+
+                    case 'depositar': {
+
+                        const valorTexto =
+                            args[0]?.replace(',', '.');
+
+                        const valor =
+                            Number(valorTexto);
+
+                        if (
+                            !Number.isFinite(valor) ||
+                            valor <= 0 ||
+                            !Number.isInteger(valor)
+                        ) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Informe um valor inteiro válido.\n\n' +
+                                        'Exemplo: *.depositar 500*'
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        if (user.carteira < valor) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Você não possui esse valor na carteira.'
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        user.carteira -= valor;
+                        user.banco += valor;
+
+                        saveDB(db);
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    `🏦 Depósito realizado!\n\n` +
+                                    `💰 Valor: *R$ ${valor}*\n` +
+                                    `🪙 Carteira: *R$ ${user.carteira}*\n` +
+                                    `🏦 Banco: *R$ ${user.banco}*`
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+
+
+                    case 'sacar': {
+
+                        const valorTexto =
+                            args[0]?.replace(',', '.');
+
+                        const valor =
+                            Number(valorTexto);
+
+                        if (
+                            !Number.isFinite(valor) ||
+                            valor <= 0 ||
+                            !Number.isInteger(valor)
+                        ) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Informe um valor inteiro válido.\n\n' +
+                                        'Exemplo: *.sacar 500*'
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        if (user.banco < valor) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Você não possui esse valor no banco.'
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        user.banco -= valor;
+                        user.carteira += valor;
+
+                        saveDB(db);
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    `🏧 Saque realizado!\n\n` +
+                                    `💰 Valor: *R$ ${valor}*\n` +
+                                    `🪙 Carteira: *R$ ${user.carteira}*\n` +
+                                    `🏦 Banco: *R$ ${user.banco}*`
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+
+
+                    case 'curar': {
+
+                        if (user.hp >= 100) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❤️ Seu HP já está cheio!'
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        const custo = 50;
+
+                        if (user.carteira < custo) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `❌ Você precisa de *R$ ${custo}* para se curar.`
+                                },
+                                { quoted: msg }
+                            );
+                            break;
+                        }
+
+                        user.carteira -= custo;
+                        user.hp = 100;
+
+                        saveDB(db);
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    '💊 *CURA REALIZADA!*\n\n' +
+                                    '❤️ HP restaurado para *100/100*.\n' +
+                                    `💰 Custo: *R$ ${custo}*`
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+                    // =========================================================
+                    // JOGOS & CASSINO
+                    // =========================================================
+
+                    case 'tigrinho': {
+                        const aposta = Number(args[0]);
+
+                        if (!Number.isInteger(aposta) || aposta <= 0) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text: '⚠️ Informe uma aposta válida.\n\nExemplo: *.tigrinho 100*'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        if (aposta > user.carteira) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text: `⚠️ Saldo insuficiente.\n💰 Sua carteira: *R$ ${user.carteira}*`
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        // Aposta é retirada antes do resultado
+                        user.carteira -= aposta;
+                        user.jogos = (user.jogos || 0) + 1;
+
+                        const venceu = Math.random() < 0.45;
+
+                        if (venceu) {
+                            const premio = aposta * 2;
+                            user.carteira += premio;
+                            user.vitorias = (user.vitorias || 0) + 1;
+
+                            saveDB(db);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `🎰 *PYDA TIGRINHO*\n` +
+                                        `━━━━━━━━━━━━━━━━━━━━\n` +
+                                        `🎉 *VOCÊ GANHOU!*\n\n` +
+                                        `💰 Aposta: *R$ ${aposta}*\n` +
+                                        `🏆 Prêmio: *R$ ${premio}*\n` +
+                                        `💳 Carteira: *R$ ${user.carteira}*\n` +
+                                        `━━━━━━━━━━━━━━━━━━━━`
+                                },
+                                { quoted: msg }
+                            );
+                        } else {
+                            saveDB(db);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `🎰 *PYDA TIGRINHO*\n` +
+                                        `━━━━━━━━━━━━━━━━━━━━\n` +
+                                        `😿 Você perdeu!\n\n` +
+                                        `💸 Perda: *R$ ${aposta}*\n` +
+                                        `💳 Carteira: *R$ ${user.carteira}*\n` +
+                                        `━━━━━━━━━━━━━━━━━━━━`
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    case 'caraoucoroa': {
+                        const escolha = args[0]?.toLowerCase();
+                        const aposta = Number(args[1]);
+
+                        if (!['cara', 'coroa'].includes(escolha)) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Escolha *cara* ou *coroa*.\n\n' +
+                                        'Exemplo:\n*.caraoucoroa cara 100*'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        if (!Number.isInteger(aposta) || aposta <= 0) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text: '⚠️ Informe uma aposta válida.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        if (aposta > user.carteira) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text: '⚠️ Você não possui saldo suficiente.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        const resultado =
+                            Math.random() < 0.5 ? 'cara' : 'coroa';
+
+                        user.carteira -= aposta;
+                        user.jogos = (user.jogos || 0) + 1;
+
+                        if (escolha === resultado) {
+                            user.carteira += aposta * 2;
+                            user.vitorias = (user.vitorias || 0) + 1;
+
+                            saveDB(db);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `🪙 *CARA OU COROA*\n` +
+                                        `━━━━━━━━━━━━━━━━━━━━\n` +
+                                        `🪙 Resultado: *${resultado.toUpperCase()}*\n` +
+                                        `🎉 Você acertou!\n\n` +
+                                        `🏆 Prêmio: *R$ ${aposta * 2}*\n` +
+                                        `💳 Carteira: *R$ ${user.carteira}*\n` +
+                                        `━━━━━━━━━━━━━━━━━━━━`
+                                },
+                                { quoted: msg }
+                            );
+                        } else {
+                            saveDB(db);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `🪙 *CARA OU COROA*\n` +
+                                        `━━━━━━━━━━━━━━━━━━━━\n` +
+                                        `🪙 Resultado: *${resultado.toUpperCase()}*\n` +
+                                        `❌ Você perdeu!\n\n` +
+                                        `💸 Perda: *R$ ${aposta}*\n` +
+                                        `💳 Carteira: *R$ ${user.carteira}*\n` +
+                                        `━━━━━━━━━━━━━━━━━━━━`
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    case 'dado': {
+                        const numero = Math.floor(Math.random() * 6) + 1;
+
+                        const faces = {
+                            1: '⚀',
+                            2: '⚁',
+                            3: '⚂',
+                            4: '⚃',
+                            5: '⚄',
+                            6: '⚅'
+                        };
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    `🎲 *DADO*\n` +
+                                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                                    `${faces[numero]} Você tirou *${numero}*!\n` +
+                                    `━━━━━━━━━━━━━━━━━━━━`
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+
+                    // =========================================================
+                    // OSINT / CONSULTAS PÚBLICAS
+                    // =========================================================
+
+                    case 'cep': {
+                        const cleanCep = args.join('').replace(/\D/g, '');
+
+                        if (cleanCep.length !== 8) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Informe um CEP válido com 8 dígitos.\n\n' +
+                                        'Exemplo: *.cep 01001000*'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        try {
+                            const response = await axios.get(
+                                `https://viacep.com.br/ws/${cleanCep}/json/`,
+                                { timeout: 8000 }
+                            );
+
+                            const data = response.data;
+
+                            if (data.erro) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text: '❌ CEP não encontrado.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const resultado =
+                                `📍 *CONSULTA DE CEP*\n` +
+                                `━━━━━━━━━━━━━━━━━━━━\n` +
+                                `📮 CEP: *${data.cep || cleanCep}*\n` +
+                                `🏠 Logradouro: *${data.logradouro || 'N/A'}*\n` +
+                                `🏡 Bairro: *${data.bairro || 'N/A'}*\n` +
+                                `🌆 Cidade: *${data.localidade || 'N/A'}*\n` +
+                                `🇧🇷 UF: *${data.uf || 'N/A'}*\n` +
+                                `📞 DDD: *${data.ddd || 'N/A'}*\n` +
+                                `━━━━━━━━━━━━━━━━━━━━`;
+
+                            await sock.sendMessage(
+                                from,
+                                { text: resultado },
+                                { quoted: msg }
+                            );
+                        } catch (error) {
+                            console.error('Erro CEP:', error.message);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Não foi possível consultar o CEP agora.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    case 'cnpj': {
+                        const cleanCnpj = args.join('').replace(/\D/g, '');
+
+                        if (cleanCnpj.length !== 14) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Informe um CNPJ válido com 14 dígitos.\n\n' +
+                                        'Exemplo: *.cnpj 11222333000181*'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        try {
+                            let data = null;
+
+                            // Primeira API
+                            try {
+                                const response = await axios.get(
+                                    `https://brasilapi.com.br/api/cnpj/v1/${cleanCnpj}`,
+                                    { timeout: 8000 }
+                                );
+
+                                data = response.data;
+                            } catch (error) {
+                                // Segunda API
+                                try {
+                                    const response = await axios.get(
+                                        `https://minhareceita.org/${cleanCnpj}`,
+                                        { timeout: 8000 }
+                                    );
+
+                                    data = response.data;
+                                } catch (error2) {
+                                    data = null;
+                                }
+                            }
+
+                            if (!data) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ Não foi possível localizar esse CNPJ.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const razao =
+                                data.razao_social ||
+                                data.nome_empresarial ||
+                                data.razaoSocial ||
+                                'N/A';
+
+                            const fantasia =
+                                data.nome_fantasia ||
+                                data.nomeFantasia ||
+                                'N/A';
+
+                            const situacao =
+                                data.descricao_situacao_cadastral ||
+                                data.situacao_cadastral ||
+                                data.situacao ||
+                                'N/A';
+
+                            const abertura =
+                                data.data_inicio_atividade ||
+                                data.data_de_inicio_atividade ||
+                                data.data_abertura ||
+                                'N/A';
+
+                            const cidade =
+                                data.municipio ||
+                                data.cidade ||
+                                'N/A';
+
+                            const uf = data.uf || 'N/A';
+
+                            const resultado =
+                                `🏢 *CONSULTA DE CNPJ*\n` +
+                                `━━━━━━━━━━━━━━━━━━━━\n` +
+                                `📄 CNPJ: *${cleanCnpj}*\n` +
+                                `🏷️ Razão Social: *${razao}*\n` +
+                                `📌 Nome Fantasia: *${fantasia}*\n` +
+                                `🟢 Situação: *${situacao}*\n` +
+                                `📅 Abertura: *${abertura}*\n` +
+                                `🌆 Cidade/UF: *${cidade} - ${uf}*\n` +
+                                `━━━━━━━━━━━━━━━━━━━━`;
+
+                            await sock.sendMessage(
+                                from,
+                                { text: resultado },
+                                { quoted: msg }
+                            );
+                        } catch (error) {
+                            console.error('Erro CNPJ:', error.message);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Erro ao consultar o CNPJ.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    case 'ip': {
+                        const ipQuery = args[0]?.trim();
+
+                        if (!ipQuery) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Informe um endereço IP.\n\n' +
+                                        'Exemplo: *.ip 8.8.8.8*'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        try {
+                            const response = await axios.get(
+                                `http://ip-api.com/json/${encodeURIComponent(ipQuery)}?fields=status,message,query,country,regionName,city,zip,isp,org,lat,lon`,
+                                { timeout: 8000 }
+                            );
+
+                            const data = response.data;
+
+                            if (data.status !== 'success') {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            `❌ Não foi possível consultar o IP.\n` +
+                                            `Motivo: ${data.message || 'IP inválido'}`
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const resultado =
+                                `🌐 *CONSULTA DE IP*\n` +
+                                `━━━━━━━━━━━━━━━━━━━━\n` +
+                                `🖥️ IP: *${data.query}*\n` +
+                                `🌍 País: *${data.country || 'N/A'}*\n` +
+                                `🏙️ Região: *${data.regionName || 'N/A'}*\n` +
+                                `🌆 Cidade: *${data.city || 'N/A'}*\n` +
+                                `📮 CEP: *${data.zip || 'N/A'}*\n` +
+                                `📡 Provedor: *${data.isp || 'N/A'}*\n` +
+                                `🏢 Organização: *${data.org || 'N/A'}*\n` +
+                                `📍 Coordenadas: *${data.lat ?? 'N/A'}, ${data.lon ?? 'N/A'}*\n` +
+                                `━━━━━━━━━━━━━━━━━━━━`;
+
+                            await sock.sendMessage(
+                                from,
+                                { text: resultado },
+                                { quoted: msg }
+                            );
+                        } catch (error) {
+                            console.error('Erro IP:', error.message);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Falha ao consultar o IP.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    case 'search': {
+                        const searchQuery = args.join(' ').trim();
+
+                        if (!searchQuery) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Digite algo para pesquisar.\n\n' +
+                                        'Exemplo: *.search Termux Linux*'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        if (!SERPAPI_KEY) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ A chave da SerpAPI não está configurada.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        try {
+                            const response = await axios.get(
+                                'https://serpapi.com/search.json',
+                                {
+                                    params: {
+                                        q: searchQuery,
+                                        api_key: SERPAPI_KEY,
+                                        hl: 'pt-br',
+                                        gl: 'br'
+                                    },
+                                    timeout: 12000
+                                }
+                            );
+
+                            const results =
+                                response.data?.organic_results?.slice(0, 5) || [];
+
+                            if (results.length === 0) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ Nenhum resultado encontrado.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            let resultado =
+                                `🔎 *RESULTADOS DA PESQUISA*\n` +
+                                `━━━━━━━━━━━━━━━━━━━━\n`;
+
+                            results.forEach((item, index) => {
+                                resultado +=
+                                    `\n*${index + 1}. ${item.title || 'Sem título'}*\n` +
+                                    `🔗 ${item.link || 'Sem link'}\n` +
+                                    `📝 ${item.snippet || 'Sem descrição'}\n`;
+                            });
+
+                            resultado +=
+                                `\n━━━━━━━━━━━━━━━━━━━━`;
+
+                            await sock.sendMessage(
+                                from,
+                                { text: resultado },
+                                { quoted: msg }
+                            );
+                        } catch (error) {
+                            console.error('Erro SerpAPI:', error.message);
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Erro ao realizar a pesquisa.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    // =========================================================
+                    // REVELAR MÍDIA DE VISUALIZAÇÃO ÚNICA
+                    // =========================================================
+
+                    case 'revelar': {
+                        let quotedMsg =
+                            msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+
+                        if (!quotedMsg) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Responda a uma mídia de visualização única com *.revelar*.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        // Compatibilidade com diferentes versões do WhatsApp
+                        if (quotedMsg.viewOnceMessage?.message) {
+                            quotedMsg = quotedMsg.viewOnceMessage.message;
+                        }
+
+                        if (quotedMsg.viewOnceMessageV2?.message) {
+                            quotedMsg = quotedMsg.viewOnceMessageV2.message;
+                        }
+
+                        if (quotedMsg.viewOnceMessageV2Extension?.message) {
+                            quotedMsg =
+                                quotedMsg.viewOnceMessageV2Extension.message;
+                        }
+
+                        const imageMsg = quotedMsg.imageMessage;
+                        const videoMsg = quotedMsg.videoMessage;
+
+                        if (!imageMsg && !videoMsg) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ A mensagem marcada não contém uma mídia compatível.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        try {
+                            const mediaType = imageMsg ? 'image' : 'video';
+
+                            const stream =
+                                await downloadContentFromMessage(
+                                    imageMsg || videoMsg,
+                                    mediaType
+                                );
+
+                            const chunks = [];
+
+                            for await (const chunk of stream) {
+                                chunks.push(chunk);
+                            }
+
+                            const buffer = Buffer.concat(chunks);
+
+                            if (!buffer.length) {
+                                throw new Error('Mídia vazia');
+                            }
+
+                            if (mediaType === 'image') {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        image: buffer,
+                                        caption: '🔓 *Mídia revelada!*'
+                                    },
+                                    { quoted: msg }
+                                );
+                            } else {
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        video: buffer,
+                                        caption: '🔓 *Mídia revelada!*'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+                        } catch (error) {
+                            console.error(
+                                'Erro ao revelar mídia:',
+                                error.message
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Não foi possível baixar a mídia.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    // =========================================================
+                    // FERRAMENTAS
+                    // =========================================================
+
+                    case 'senha': {
+                        let length = Number(args[0]);
+
+                        if (!Number.isInteger(length)) {
+                            length = 12;
+                        }
+
+                        // Evita senhas absurdamente grandes
+                        length = Math.max(4, Math.min(length, 64));
+
+                        const chars =
+                            'ABCDEFGHIJKLMNOPQRSTUVWXYZ' +
+                            'abcdefghijklmnopqrstuvwxyz' +
+                            '0123456789' +
+                            '!@#$%^&*()_+-=';
+
+                        let password = '';
+
+                        for (let i = 0; i < length; i++) {
+                            password +=
+                                chars[Math.floor(Math.random() * chars.length)];
+                        }
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    `🔐 *SENHA GERADA*\n` +
+                                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                                    `🔑 \`${password}\`\n` +
+                                    `📏 Tamanho: *${length} caracteres*\n` +
+                                    `━━━━━━━━━━━━━━━━━━━━`
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+
+                    case 'encurtar': {
+                        const url = args[0]?.trim();
+
+                        if (!url) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Envie uma URL.\n\n' +
+                                        'Exemplo: *.encurtar https://google.com*'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        try {
+                            const response = await axios.get(
+                                'https://tinyurl.com/api-create.php',
+                                {
+                                    params: {
+                                        url
+                                    },
+                                    timeout: 10000
+                                }
+                            );
+
+                            const shortUrl = String(response.data || '').trim();
+
+                            if (!shortUrl.startsWith('http')) {
+                                throw new Error('URL encurtada inválida');
+                            }
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `🔗 *LINK ENCURTADO*\n` +
+                                        `━━━━━━━━━━━━━━━━━━━━\n` +
+                                        `${shortUrl}\n` +
+                                        `━━━━━━━━━━━━━━━━━━━━`
+                                },
+                                { quoted: msg }
+                            );
+                        } catch (error) {
+                            console.error(
+                                'Erro TinyURL:',
+                                error.message
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Não foi possível encurtar esse link.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    // =========================================================
+                    // ADMINISTRAÇÃO DE GRUPOS
+                    // =========================================================
+
+                    case 'hidetag': {
+                        if (!isGroup) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Este comando só funciona em grupos.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        try {
+                            const groupMetadata =
+                                await sock.groupMetadata(from);
+
+                            const senderParticipant =
+                                groupMetadata.participants.find(
+                                    p => p.id === sender
+                                );
+
+                            if (!senderParticipant?.admin) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ Apenas administradores podem usar este comando.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const participants =
+                                groupMetadata.participants.map(p => p.id);
+
+                            const textHide =
+                                args.join(' ').trim() ||
+                                '📢 Comunicado Geral!';
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text: textHide,
+                                    mentions: participants
+                                },
+                                { quoted: msg }
+                            );
+                        } catch (error) {
+                            console.error(
+                                'Erro hidetag:',
+                                error.message
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Não foi possível executar o hidetag.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    case 'ban':
+                    case 'kick': {
+                        if (!isGroup) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Este comando só funciona em grupos.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        try {
+                            const groupMetadata =
+                                await sock.groupMetadata(from);
+
+                            const senderParticipant =
+                                groupMetadata.participants.find(
+                                    p => p.id === sender
+                                );
+
+                            if (!senderParticipant?.admin) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ Apenas administradores podem remover membros.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const botId =
+                                sock.user?.id?.split(':')[0] +
+                                '@s.whatsapp.net';
+
+                            const botParticipant =
+                                groupMetadata.participants.find(
+                                    p =>
+                                        p.id === botId ||
+                                        p.id?.split(':')[0] ===
+                                            sock.user?.id?.split(':')[0]
+                                );
+
+                            if (!botParticipant?.admin) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ O Pyda precisa ser Administrador do grupo.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const contextInfo =
+                                msg.message?.extendedTextMessage
+                                    ?.contextInfo;
+
+                            const quotedSender =
+                                contextInfo?.participant;
+
+                            const mentioned =
+                                contextInfo?.mentionedJid?.[0] ||
+                                quotedSender;
+
+                            if (!mentioned) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '⚠️ Mencione o membro ou responda à mensagem dele.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            if (mentioned === botId) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '🤖 Eu não posso remover a mim mesmo.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            await sock.groupParticipantsUpdate(
+                                from,
+                                [mentioned],
+                                'remove'
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `🚨 @${mentioned.split('@')[0]} foi removido do grupo!`,
+                                    mentions: [mentioned]
+                                },
+                                { quoted: msg }
+                            );
+                        } catch (error) {
+                            console.error(
+                                'Erro ao remover membro:',
+                                error.message
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Não foi possível remover o membro. Verifique se o bot possui administrador.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    case 'promover': {
+                        if (!isGroup) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Este comando só funciona em grupos.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        try {
+                            const groupMetadata =
+                                await sock.groupMetadata(from);
+
+                            const senderParticipant =
+                                groupMetadata.participants.find(
+                                    p => p.id === sender
+                                );
+
+                            if (!senderParticipant?.admin) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ Apenas administradores podem promover membros.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const botNumber =
+                                sock.user?.id?.split(':')[0];
+
+                            const botParticipant =
+                                groupMetadata.participants.find(
+                                    p =>
+                                        p.id?.split(':')[0] ===
+                                        botNumber
+                                );
+
+                            if (!botParticipant?.admin) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ O Pyda precisa ser Administrador do grupo.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const contextInfo =
+                                msg.message?.extendedTextMessage
+                                    ?.contextInfo;
+
+                            const mentioned =
+                                contextInfo?.mentionedJid?.[0] ||
+                                contextInfo?.participant;
+
+                            if (!mentioned) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '⚠️ Mencione o membro ou responda à mensagem dele.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            await sock.groupParticipantsUpdate(
+                                from,
+                                [mentioned],
+                                'promote'
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `👑 @${mentioned.split('@')[0]} agora é Administrador!`,
+                                    mentions: [mentioned]
+                                },
+                                { quoted: msg }
+                            );
+                        } catch (error) {
+                            console.error(
+                                'Erro promover:',
+                                error.message
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Não foi possível promover o membro.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    case 'rebaixar': {
+                        if (!isGroup) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Este comando só funciona em grupos.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        try {
+                            const groupMetadata =
+                                await sock.groupMetadata(from);
+
+                            const senderParticipant =
+                                groupMetadata.participants.find(
+                                    p => p.id === sender
+                                );
+
+                            if (!senderParticipant?.admin) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ Apenas administradores podem rebaixar membros.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const botNumber =
+                                sock.user?.id?.split(':')[0];
+
+                            const botParticipant =
+                                groupMetadata.participants.find(
+                                    p =>
+                                        p.id?.split(':')[0] ===
+                                        botNumber
+                                );
+
+                            if (!botParticipant?.admin) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ O Pyda precisa ser Administrador do grupo.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const contextInfo =
+                                msg.message?.extendedTextMessage
+                                    ?.contextInfo;
+
+                            const mentioned =
+                                contextInfo?.mentionedJid?.[0] ||
+                                contextInfo?.participant;
+
+                            if (!mentioned) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '⚠️ Mencione o membro ou responda à mensagem dele.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            await sock.groupParticipantsUpdate(
+                                from,
+                                [mentioned],
+                                'demote'
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        `📉 @${mentioned.split('@')[0]} foi rebaixado.`,
+                                    mentions: [mentioned]
+                                },
+                                { quoted: msg }
+                            );
+                        } catch (error) {
+                            console.error(
+                                'Erro rebaixar:',
+                                error.message
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Não foi possível rebaixar o membro.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    case 'warn': {
+                        if (!isGroup) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Este comando só funciona em grupos.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        try {
+                            const groupMetadata =
+                                await sock.groupMetadata(from);
+
+                            const senderParticipant =
+                                groupMetadata.participants.find(
+                                    p => p.id === sender
+                                );
+
+                            if (!senderParticipant?.admin) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '❌ Apenas administradores podem aplicar advertências.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const contextInfo =
+                                msg.message?.extendedTextMessage
+                                    ?.contextInfo;
+
+                            const mentioned =
+                                contextInfo?.mentionedJid?.[0] ||
+                                contextInfo?.participant;
+
+                            if (!mentioned) {
+                                return await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            '⚠️ Mencione o membro ou responda à mensagem dele.'
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+
+                            const warnedUser =
+                                getUser(db, mentioned, 'Membro');
+
+                            warnedUser.warnings =
+                                Number(warnedUser.warnings || 0) + 1;
+
+                            if (warnedUser.warnings >= 3) {
+                                const botNumber =
+                                    sock.user?.id?.split(':')[0];
+
+                                const botParticipant =
+                                    groupMetadata.participants.find(
+                                        p =>
+                                            p.id?.split(':')[0] ===
+                                            botNumber
+                                    );
+
+                                if (botParticipant?.admin) {
+                                    try {
+                                        await sock.groupParticipantsUpdate(
+                                            from,
+                                            [mentioned],
+                                            'remove'
+                                        );
+
+                                        warnedUser.warnings = 0;
+                                        saveDB(db);
+
+                                        await sock.sendMessage(
+                                            from,
+                                            {
+                                                text:
+                                                    `🚨 @${mentioned.split('@')[0]} atingiu *3 advertências* e foi removido!`,
+                                                mentions: [mentioned]
+                                            },
+                                            { quoted: msg }
+                                        );
+                                    } catch (error) {
+                                        saveDB(db);
+
+                                        await sock.sendMessage(
+                                            from,
+                                            {
+                                                text:
+                                                    `⚠️ @${mentioned.split('@')[0]} atingiu *3/3 advertências*, mas não consegui removê-lo.`,
+                                                mentions: [mentioned]
+                                            },
+                                            { quoted: msg }
+                                        );
+                                    }
+                                } else {
+                                    saveDB(db);
+
+                                    await sock.sendMessage(
+                                        from,
+                                        {
+                                            text:
+                                                `⚠️ @${mentioned.split('@')[0]} atingiu *3/3 advertências*, mas o Pyda precisa ser administrador para removê-lo.`,
+                                            mentions: [mentioned]
+                                        },
+                                        { quoted: msg }
+                                    );
+                                }
+                            } else {
+                                saveDB(db);
+
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            `⚠️ @${mentioned.split('@')[0]} recebeu uma advertência!\n\n` +
+                                            `📊 Advertências: *${warnedUser.warnings}/3*`,
+                                        mentions: [mentioned]
+                                    },
+                                    { quoted: msg }
+                                );
+                            }
+                        } catch (error) {
+                            console.error(
+                                'Erro warn:',
+                                error.message
+                            );
+
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Não foi possível aplicar a advertência.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        break;
+                    }
+
+                    // =========================================================
+                    // COMANDOS DO DONO
+                    // =========================================================
+
+                    case 'bc': {
+                        /*
+                         * Segurança:
+                         * msg.key.fromMe significa que o comando foi enviado
+                         * pela própria conta conectada ao bot.
+                         *
+                         * Assim, o comando não fica liberado para qualquer
+                         * administrador do grupo.
+                         */
+                        if (!msg.key.fromMe) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Este comando é exclusivo do dono do bot.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        const textBc = args.join(' ').trim();
+
+                        if (!textBc) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Digite a mensagem da transmissão.\n\n' +
+                                        'Exemplo: *.bc Bom dia, pessoal!*'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        const chats = Object.keys(db.groups);
+
+                        if (chats.length === 0) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '⚠️ Nenhum grupo registrado no banco de dados.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        let enviados = 0;
+                        let falhas = 0;
+
+                        for (const chatId of chats) {
+                            try {
+                                await sock.sendMessage(
+                                    chatId,
+                                    {
+                                        text:
+                                            `📢 *TRANSMISSÃO PYDA*\n\n${textBc}`
+                                    }
+                                );
+
+                                enviados++;
+
+                                // Pequena pausa para evitar disparos
+                                // extremamente rápidos.
+                                await new Promise(resolve =>
+                                    setTimeout(resolve, 500)
+                                );
+                            } catch (error) {
+                                falhas++;
+                                console.error(
+                                    `Erro BC em ${chatId}:`,
+                                    error.message
+                                );
+                            }
+                        }
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    `✅ *TRANSMISSÃO FINALIZADA*\n\n` +
+                                    `📨 Enviados: *${enviados}*\n` +
+                                    `❌ Falhas: *${falhas}*`
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+
+                    case 'restart': {
+                        if (!msg.key.fromMe) {
+                            return await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        '❌ Este comando é exclusivo do dono do bot.'
+                                },
+                                { quoted: msg }
+                            );
+                        }
+
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    '⚙️ *Reiniciando o Pyda...*\n\nAguarde alguns segundos.'
+                            },
+                            { quoted: msg }
+                        );
+
+                        /*
+                         * O processo será encerrado.
+                         *
+                         * Se você estiver usando PM2, Docker ou outro
+                         * gerenciador de processos, ele poderá iniciar
+                         * novamente automaticamente.
+                         */
+                        setTimeout(() => {
+                            process.exit(0);
+                        }, 1000);
+
+                        break;
+                    }
+
+                    // =========================================================
+                    // COMANDO DESCONHECIDO
+                    // =========================================================
+
+                    default: {
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    `❓ Comando *.${command}* não encontrado.\n\n` +
+                                    `Digite *.menu* para ver os comandos disponíveis.`
+                            },
+                            { quoted: msg }
+                        );
+
+                        break;
+                    }
+                }
+            } catch (err) {
+                console.error(
+                    '❌ Erro ao processar mensagem:',
+                    err
+                );
+
+                try {
+                    if (from) {
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    '❌ Ocorreu um erro interno ao processar o comando.'
+                            },
+                            { quoted: msg }
+                        );
+                    }
+                } catch (sendError) {
+                    console.error(
+                        'Erro ao enviar mensagem de erro:',
+                        sendError.message
+                    );
                 }
             }
         }
     });
 }
 
-connectToWhatsApp();
+// =========================================================
+// INICIALIZAÇÃO DO PYDA
+// =========================================================
+
+connectToWhatsApp().catch(error => {
+    console.error(
+        '❌ Erro fatal ao iniciar o Pyda:',
+        error
+    );
+
+    process.exit(1);
+});
