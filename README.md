@@ -21,7 +21,7 @@ Certifique-se de ter o **Node.js** e o **Git** instalados no seu ambiente (Termu
 
 ### 1. Clonar o repositório
 ```bash
-git clone [https://github.com/Amaral1803657272/pyda-bot.git]
+git clone https://github.com/Amaral1803657272/pyda-bot.git
 cd pyda-bot
 2. Instalar as dependências
 npm install
